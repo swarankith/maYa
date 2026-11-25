@@ -1,14 +1,31 @@
 import { db, DEMO_WORKSPACE_ID } from './db.ts';
 import {
   extractAndStageEmailBatch,
+  extractHttpStatus,
   hasConfiguredGeminiApiKey,
   isRetryableGeminiError,
-  parseRetryDelayMs,
+  isSchemaValidationError,
   sanitizeExtractionError,
+  type BatchEntryValidationFailure,
   type ExtractableEmailMessage,
   type GeminiGenerateFn,
 } from './emailContextService.ts';
+import {
+  GeminiCooldownActiveError,
+  GeminiQuotaCoordinator,
+  sharedGeminiLimiter,
+} from './geminiRateLimiter.ts';
 import type { ExtractionPipelineSummary } from '../types/maya.ts';
+
+function isParseOrStructureBatchError(err: unknown): boolean {
+  if (isSchemaValidationError(err)) return false;
+  const msg = (err instanceof Error ? err.message : String(err)).toUpperCase();
+  return (
+    msg.includes('MALFORMED JSON') ||
+    msg.includes('EMPTY EXTRACTION RESPONSE') ||
+    msg.includes('MISSING "RESULTS" ARRAY')
+  );
+}
 
 export interface ExtractionQueueConfig {
   concurrency: number;
@@ -22,6 +39,7 @@ export interface ExtractionQueueConfig {
   nowFn?: () => number;
   sleepFn?: (ms: number) => Promise<void>;
   randomFn?: () => number;
+  rateLimiter?: GeminiQuotaCoordinator;
 }
 
 export interface ProcessQueueResult {
@@ -62,15 +80,13 @@ const defaultSleep = (ms: number) =>
 
 export class ExtractionQueueController {
   private readonly config: Required<
-    Omit<ExtractionQueueConfig, 'minSpacingMs'>
+    Omit<ExtractionQueueConfig, 'minSpacingMs' | 'rateLimiter'>
   > & { minSpacingMs: number };
 
-  private callTimestamps: number[] = [];
-  private cooldownUntilMs = 0;
-  private activeWorkers = 0;
-  private slotMutex: Promise<void> = Promise.resolve();
+  readonly rateLimiter: GeminiQuotaCoordinator;
   private runningWorkspaces = new Map<string, Promise<ProcessQueueResult>>();
   private scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private startupInitialized = false;
 
   constructor(overrides?: Partial<ExtractionQueueConfig>) {
     const defaults = getDefaultQueueConfig();
@@ -92,81 +108,51 @@ export class ExtractionQueueController {
       sleepFn: overrides?.sleepFn ?? defaultSleep,
       randomFn: overrides?.randomFn ?? (() => Math.random()),
     };
+
+    if (overrides?.rateLimiter) {
+      this.rateLimiter = overrides.rateLimiter;
+    } else if (
+      overrides &&
+      (overrides.concurrency !== undefined ||
+        overrides.requestsPerMinute !== undefined ||
+        overrides.windowMs !== undefined ||
+        overrides.minSpacingMs !== undefined ||
+        overrides.nowFn !== undefined ||
+        overrides.sleepFn !== undefined ||
+        overrides.randomFn !== undefined ||
+        overrides.baseBackoffMs !== undefined)
+    ) {
+      this.rateLimiter = new GeminiQuotaCoordinator({
+        concurrency: this.config.concurrency,
+        requestsPerMinute: this.config.requestsPerMinute,
+        windowMs: this.config.windowMs,
+        minSpacingMs: this.config.minSpacingMs,
+        defaultRateLimitCooldownMs: this.config.baseBackoffMs,
+        persistToDb: false,
+        nowFn: this.config.nowFn,
+        sleepFn: this.config.sleepFn,
+        randomFn: this.config.randomFn,
+      });
+    } else {
+      this.rateLimiter = sharedGeminiLimiter;
+    }
   }
 
   getSummaryConfig(): { rateLimitRpm: number; batchSize: number } {
+    const quota = this.rateLimiter.getQuotaSummary();
     return {
-      rateLimitRpm: this.config.requestsPerMinute,
+      rateLimitRpm: quota.requestsPerMinute,
       batchSize: this.config.batchSize,
     };
   }
 
   computeBackoffDelayMs(currentRetryCount: number, err?: unknown): number {
-    const expMs = this.config.baseBackoffMs * Math.pow(2, Math.max(currentRetryCount, 0));
-    const jitterMs = Math.round(expMs * 0.25 * this.config.randomFn());
-    const apiHintMs = parseRetryDelayMs(err) ?? 0;
-    return Math.min(this.config.maxBackoffMs, Math.max(expMs + jitterMs, apiHintMs));
-  }
-
-  private async acquireRateLimitAndConcurrencySlot(): Promise<void> {
-    // Wait until a concurrency slot is available
-    while (this.activeWorkers >= this.config.concurrency) {
-      await this.config.sleepFn(25);
-    }
-    this.activeWorkers += 1;
-
-    // Serialize rate-limit calculations across concurrent workers
-    const releaseMutex = this.slotMutex;
-    let resolveNext!: () => void;
-    this.slotMutex = new Promise<void>((res) => {
-      resolveNext = res;
-    });
-
-    try {
-      await releaseMutex;
-
-      while (true) {
-        const now = this.config.nowFn();
-        const windowStart = now - this.config.windowMs;
-        this.callTimestamps = this.callTimestamps.filter((ts) => ts > windowStart);
-
-        let waitMs = 0;
-
-        if (this.cooldownUntilMs > now) {
-          waitMs = Math.max(waitMs, this.cooldownUntilMs - now);
-        }
-
-        if (this.callTimestamps.length >= this.config.requestsPerMinute) {
-          const oldestInWindow = this.callTimestamps[0];
-          waitMs = Math.max(waitMs, oldestInWindow + this.config.windowMs - now + 10);
-        }
-
-        if (this.callTimestamps.length > 0 && this.config.minSpacingMs > 0) {
-          const lastCall = this.callTimestamps[this.callTimestamps.length - 1];
-          const elapsed = now - lastCall;
-          if (elapsed < this.config.minSpacingMs) {
-            waitMs = Math.max(waitMs, this.config.minSpacingMs - elapsed);
-          }
-        }
-
-        if (waitMs <= 0) {
-          this.callTimestamps.push(now);
-          break;
-        }
-
-        await this.config.sleepFn(waitMs);
-      }
-    } catch (err) {
-      this.activeWorkers = Math.max(0, this.activeWorkers - 1);
-      resolveNext();
-      throw err;
-    }
-
-    resolveNext();
-  }
-
-  private releaseConcurrencySlot(): void {
-    this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+    return this.rateLimiter.computeSafeBackoffMs(
+      currentRetryCount,
+      this.config.baseBackoffMs,
+      this.config.maxBackoffMs,
+      err,
+    );
   }
 
   private claimNextBatch(workspaceId: string, nowIso: string): Array<
@@ -263,7 +249,7 @@ export class ExtractionQueueController {
           const nextMs = nowMs + delayMs;
           const nextIso = new Date(nextMs).toISOString();
           if (applyGlobalCooldown) {
-            this.cooldownUntilMs = Math.max(this.cooldownUntilMs, nextMs);
+            this.rateLimiter.applyCooldownUntilMs(nextMs, sanitized, extractHttpStatus(err));
           }
           updateRetry.run(
             nextRetryNum,
@@ -284,6 +270,45 @@ export class ExtractionQueueController {
 
     tx();
     return { retryingCount, failedCount, earliestNextRetryMs };
+  }
+
+  private markSchemaValidationFailures(
+    workspaceId: string,
+    batch: Array<ExtractableEmailMessage & { retryCount: number; maxRetries: number }>,
+    invalidEntries: BatchEntryValidationFailure[],
+  ): number {
+    if (invalidEntries.length === 0) return 0;
+
+    const retryCountById = new Map(batch.map((m) => [m.messageRowId, m.retryCount]));
+    const updateFailed = db.prepare(`
+      UPDATE gmail_messages
+      SET extraction_status = 'FAILED',
+          retry_count = ?,
+          next_retry_at = NULL,
+          extraction_error = ?
+      WHERE id = ? AND workspace_id = ? AND extraction_status != 'COMPLETED'
+    `);
+
+    let failedCount = 0;
+    const tx = db.transaction(() => {
+      for (const entry of invalidEntries) {
+        const currentRetries = retryCountById.get(entry.messageRowId) ?? 0;
+        const sanitizedDiag = sanitizeExtractionError(entry.diagnosticMessage);
+        const info = updateFailed.run(
+          currentRetries + 1,
+          sanitizedDiag,
+          entry.messageRowId,
+          workspaceId,
+        );
+        if (info.changes > 0) {
+          failedCount += 1;
+          console.warn(`[extractionQueue] ${sanitizedDiag}`);
+        }
+      }
+    });
+
+    tx();
+    return failedCount;
   }
 
   private findNextRetryTimestampMs(workspaceId: string): number | null {
@@ -307,7 +332,7 @@ export class ExtractionQueueController {
       this.scheduledTimers.delete(workspaceId);
     }
 
-    const boundedDelay = Math.min(Math.max(delayMs, 50), 300_000);
+    const boundedDelay = Math.min(Math.max(delayMs, 50), 1_800_000);
     const timer = setTimeout(() => {
       this.scheduledTimers.delete(workspaceId);
       this.enqueueWorkspaceExtraction(workspaceId);
@@ -376,18 +401,32 @@ export class ExtractionQueueController {
     while (iterations < maxIterations) {
       iterations += 1;
       const nowMs = this.config.nowFn();
+      const cooldownWaitMs = this.rateLimiter.getCooldownRemainingMs();
+      if (!options?.awaitRetries && cooldownWaitMs > 0) {
+        const wakeAt = nowMs + cooldownWaitMs;
+        result.nextScheduledAt = new Date(wakeAt).toISOString();
+        this.scheduleBackgroundWakeup(workspaceId, cooldownWaitMs);
+        break;
+      }
+
       const nowIso = new Date(nowMs).toISOString();
       const batch = this.claimNextBatch(workspaceId, nowIso);
 
       if (batch.length === 0) {
         const nextRetryMs = this.findNextRetryTimestampMs(workspaceId);
-        if (nextRetryMs !== null) {
-          const waitMs = Math.max(0, nextRetryMs - this.config.nowFn());
-          if (options?.awaitRetries && waitMs <= this.config.maxBackoffMs) {
+        const cooldownUntilMs = this.rateLimiter.getCooldownUntilMs();
+        const wakeAtMs =
+          nextRetryMs !== null && cooldownUntilMs > 0
+            ? Math.max(nextRetryMs, cooldownUntilMs)
+            : nextRetryMs ?? (cooldownUntilMs > 0 ? cooldownUntilMs : null);
+
+        if (wakeAtMs !== null) {
+          const waitMs = Math.max(0, wakeAtMs - this.config.nowFn());
+          if (options?.awaitRetries && waitMs <= 1_800_000) {
             await this.config.sleepFn(waitMs);
             continue;
           }
-          result.nextScheduledAt = new Date(nextRetryMs).toISOString();
+          result.nextScheduledAt = new Date(wakeAtMs).toISOString();
           this.scheduleBackgroundWakeup(workspaceId, waitMs);
         }
         break;
@@ -410,14 +449,12 @@ export class ExtractionQueueController {
         break;
       }
 
-      await this.acquireRateLimitAndConcurrencySlot();
+      let batchErr: unknown = null;
       try {
-        result.batchesExecuted += 1;
-        const batchOutcome = await extractAndStageEmailBatch(
-          workspaceId,
-          batch,
-          options?.geminiCaller,
-        );
+        const batchOutcome = await this.rateLimiter.runWithQuota(async () => {
+          result.batchesExecuted += 1;
+          return extractAndStageEmailBatch(workspaceId, batch, options?.geminiCaller);
+        });
 
         if (batchOutcome.skippedMissingKey) {
           result.skippedCount += batch.length;
@@ -427,6 +464,14 @@ export class ExtractionQueueController {
         result.completedCount += batchOutcome.completedIds.length;
         result.itemsCreated += batchOutcome.itemsCreated;
         result.relationshipsCreated += batchOutcome.relationshipsCreated;
+
+        if (batchOutcome.invalidEntries.length > 0) {
+          result.failedCount += this.markSchemaValidationFailures(
+            workspaceId,
+            batch,
+            batchOutcome.invalidEntries,
+          );
+        }
 
         if (batchOutcome.missingIds.length > 0) {
           const missingSet = new Set(batchOutcome.missingIds);
@@ -442,15 +487,125 @@ export class ExtractionQueueController {
           result.failedCount += scheduled.failedCount;
         }
       } catch (err) {
-        const scheduled = this.scheduleRetryOrFailure(workspaceId, batch, err);
-        result.retryingCount += scheduled.retryingCount;
-        result.failedCount += scheduled.failedCount;
-      } finally {
-        this.releaseConcurrencySlot();
+        batchErr = err;
+      }
+
+      if (batchErr !== null) {
+        if (batchErr instanceof GeminiCooldownActiveError) {
+          const wakeAt = batchErr.cooldownUntilMs;
+          result.nextScheduledAt = new Date(wakeAt).toISOString();
+          this.scheduleBackgroundWakeup(workspaceId, batchErr.remainingMs);
+          break;
+        }
+        if (batch.length > 1 && isParseOrStructureBatchError(batchErr)) {
+          await this.processSplitBatchFallback(workspaceId, batch, options, result);
+        } else {
+          const isSchemaErr = isSchemaValidationError(batchErr);
+          const scheduled = this.scheduleRetryOrFailure(workspaceId, batch, batchErr, {
+            forceRetryable: isSchemaErr ? false : undefined,
+            applyGlobalCooldown: !isSchemaErr,
+          });
+          result.retryingCount += scheduled.retryingCount;
+          result.failedCount += scheduled.failedCount;
+        }
       }
     }
 
     return result;
+  }
+
+  private async processSplitBatchFallback(
+    workspaceId: string,
+    batch: Array<ExtractableEmailMessage & { retryCount: number; maxRetries: number }>,
+    options:
+      | {
+          geminiCaller?: GeminiGenerateFn;
+          awaitRetries?: boolean;
+          maxIterations?: number;
+        }
+      | undefined,
+    result: ProcessQueueResult,
+  ): Promise<void> {
+    for (let i = 0; i < batch.length; i += 1) {
+      const singleMsg = batch[i];
+
+      if (!options?.geminiCaller && !hasConfiguredGeminiApiKey()) {
+        const remaining = batch.slice(i);
+        const skipMsg =
+          'GEMINI_API_KEY not configured on server; message stored without AI extraction.';
+        const skipStmt = db.prepare(`
+          UPDATE gmail_messages
+          SET extraction_status = 'SKIPPED',
+              extraction_error = ?,
+              next_retry_at = NULL
+          WHERE id = ? AND workspace_id = ? AND extraction_status != 'COMPLETED'
+        `);
+        for (const m of remaining) {
+          const info = skipStmt.run(skipMsg, m.messageRowId, workspaceId);
+          if (info.changes > 0) {
+            result.skippedCount += 1;
+          }
+        }
+        return;
+      }
+
+      try {
+        const singleOutcome = await this.rateLimiter.runWithQuota(async () => {
+          result.batchesExecuted += 1;
+          return extractAndStageEmailBatch(workspaceId, [singleMsg], options?.geminiCaller);
+        });
+
+        if (singleOutcome.skippedMissingKey) {
+          result.skippedCount += 1;
+          continue;
+        }
+
+        result.completedCount += singleOutcome.completedIds.length;
+        result.itemsCreated += singleOutcome.itemsCreated;
+        result.relationshipsCreated += singleOutcome.relationshipsCreated;
+
+        if (singleOutcome.invalidEntries.length > 0) {
+          result.failedCount += this.markSchemaValidationFailures(
+            workspaceId,
+            [singleMsg],
+            singleOutcome.invalidEntries,
+          );
+        }
+
+        if (singleOutcome.missingIds.length > 0) {
+          const missingErr = new Error(
+            'Isolated extraction omitted messageRowId; scheduling retry.',
+          );
+          const scheduled = this.scheduleRetryOrFailure(workspaceId, [singleMsg], missingErr, {
+            forceRetryable: true,
+            applyGlobalCooldown: false,
+          });
+          result.retryingCount += scheduled.retryingCount;
+          result.failedCount += scheduled.failedCount;
+        }
+      } catch (singleErr) {
+        const isSchemaErr = isSchemaValidationError(singleErr);
+        const isParseErr = isParseOrStructureBatchError(singleErr);
+        const scheduled = this.scheduleRetryOrFailure(workspaceId, [singleMsg], singleErr, {
+          forceRetryable: isSchemaErr ? false : isParseErr ? true : undefined,
+          applyGlobalCooldown: !isSchemaErr && !isParseErr,
+        });
+        result.retryingCount += scheduled.retryingCount;
+        result.failedCount += scheduled.failedCount;
+
+        // If an isolated fallback call hit a rate-limit or transient server overload,
+        // stop hammering the API and defer remaining emails in this batch cleanly.
+        if (!isSchemaErr && !isParseErr && isRetryableGeminiError(singleErr) && i + 1 < batch.length) {
+          const remaining = batch.slice(i + 1);
+          const deferred = this.scheduleRetryOrFailure(workspaceId, remaining, singleErr, {
+            applyGlobalCooldown: true,
+          });
+          result.retryingCount += deferred.retryingCount;
+          result.failedCount += deferred.failedCount;
+          break;
+        }
+      }
+    }
   }
 
   enqueueWorkspaceExtraction(workspaceId: string): void {
@@ -527,8 +682,7 @@ export class ExtractionQueueController {
 
     tx();
 
-    // Clear global cooldown on explicit user retry so their request starts promptly
-    // once rate-limit window allows, without dropping rate-limit safety.
+    // Re-queue into workspace extraction; active global 429 cooldown remains enforced.
     if (retriedCount > 0 && options?.enqueue !== false) {
       this.enqueueWorkspaceExtraction(workspaceId);
     }
@@ -583,6 +737,57 @@ export class ExtractionQueueController {
 
     return summary;
   }
+  initializeOnStartup(options?: { enqueue?: boolean }): {
+    recoveredCount: number;
+    workspacesScheduled: number;
+  } {
+    if (this.startupInitialized) {
+      return { recoveredCount: 0, workspacesScheduled: 0 };
+    }
+    this.startupInitialized = true;
+    this.rateLimiter.restoreFromDb(true);
+
+    const recovered = db
+      .prepare(`
+        UPDATE gmail_messages
+        SET extraction_status = 'PENDING',
+            next_retry_at = NULL
+        WHERE extraction_status = 'PROCESSING'
+          AND workspace_id != ?
+      `)
+      .run(DEMO_WORKSPACE_ID);
+
+    const recoveredCount = Number(recovered.changes ?? 0);
+    if (recoveredCount > 0) {
+      console.log(
+        `[extractionQueue] Recovered ${recoveredCount} interrupted PROCESSING extraction job(s) to PENDING.`,
+      );
+    }
+
+    if (options?.enqueue === false) {
+      return { recoveredCount, workspacesScheduled: 0 };
+    }
+
+    const workspacesWithWork = db
+      .prepare(`
+        SELECT DISTINCT workspace_id
+        FROM gmail_messages
+        WHERE extraction_status IN ('PENDING', 'RETRYING')
+          AND workspace_id != ?
+      `)
+      .all(DEMO_WORKSPACE_ID) as Array<{ workspace_id: string }>;
+
+    let workspacesScheduled = 0;
+    for (const row of workspacesWithWork) {
+      const wsId = row.workspace_id;
+      if (!this.runningWorkspaces.has(wsId) && !this.scheduledTimers.has(wsId)) {
+        this.enqueueWorkspaceExtraction(wsId);
+        workspacesScheduled += 1;
+      }
+    }
+
+    return { recoveredCount, workspacesScheduled };
+  }
 }
 
 export const extractionQueue = new ExtractionQueueController();
@@ -612,4 +817,11 @@ export function retryFailedExtractions(
 
 export function getExtractionSummary(workspaceId: string): ExtractionPipelineSummary {
   return extractionQueue.getWorkspaceExtractionSummary(workspaceId);
+}
+
+export function initializeExtractionQueueOnStartup(options?: { enqueue?: boolean }): {
+  recoveredCount: number;
+  workspacesScheduled: number;
+} {
+  return extractionQueue.initializeOnStartup(options);
 }

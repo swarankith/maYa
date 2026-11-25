@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import {
   loginUser,
   registerUser,
@@ -61,6 +61,7 @@ import {
 import {
   enqueueWorkspaceExtraction,
   getExtractionSummary,
+  initializeExtractionQueueOnStartup,
   retryFailedExtractions,
 } from './src/server/extractionQueue.ts';
 import type {
@@ -77,6 +78,7 @@ import type {
 initializeDatabase();
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 
 interface AuthenticatedRequest extends Request {
@@ -1053,11 +1055,45 @@ personalRouter.post('/email-insights/relationships/:id/reject', (req: Authentica
 app.use('/api', requireAuth, personalRouter);
 
 // --- Vite / Static Serving ---
+function resolveServerPort(isProdRuntime: boolean): number {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--port' && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        return parsed;
+      }
+    } else if (arg.startsWith('--port=')) {
+      const parsed = Number(arg.slice('--port='.length));
+      if (Number.isInteger(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+
+  if (isProdRuntime && process.env.PORT) {
+    const envPort = Number(process.env.PORT);
+    if (Number.isInteger(envPort) && envPort > 0) {
+      return envPort;
+    }
+  }
+
+  return 3000;
+}
+
 async function startServer(): Promise<void> {
-  const PORT = 3000;
-  const isProd = process.env.NODE_ENV === 'production';
+  const isDevExplicit =
+    (process.env.NODE_ENV === 'development' || process.env.npm_lifecycle_event === 'dev') &&
+    process.env.npm_lifecycle_event !== 'start';
+  const isProd =
+    process.env.NODE_ENV === 'production' ||
+    process.env.npm_lifecycle_event === 'start' ||
+    !isDevExplicit;
+  const PORT = resolveServerPort(isProd);
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1065,15 +1101,31 @@ async function startServer(): Promise<void> {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
+    const indexHtmlPath = path.join(distDir, 'index.html');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api/')) {
+        res.status(404).json({ error: 'API endpoint not found.' });
+        return;
+      }
+      if (!fs.existsSync(indexHtmlPath)) {
+        res
+          .status(503)
+          .type('text/plain')
+          .send('Application build artifacts are missing. Run `npm run build` before starting.');
+        return;
+      }
+      res.sendFile(indexHtmlPath);
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`maYa multi-user server listening on http://localhost:${PORT}`);
+    initializeExtractionQueueOnStartup();
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[server] Fatal startup error:', err);
+  process.exit(1);
+});

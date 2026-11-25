@@ -4,14 +4,23 @@ import { db, initializeDatabase } from '../src/server/db.ts';
 import { registerUser, revokeSessionToken } from '../src/server/authService.ts';
 import { encryptSecret } from '../src/server/cryptoService.ts';
 import {
+  EMAIL_EXTRACTED_ITEM_TYPES,
+  EMAIL_RELEVANCE_VALUES,
+  extractAndStageEmailBatch,
+  GeminiSchemaValidationError,
   isRetryableGeminiError,
+  parseAndValidateBatchEmailExtraction,
+  parseAndValidateEmailExtraction,
   parseRetryDelayMs,
   sanitizeExtractionError,
   type GeminiGenerateFn,
 } from '../src/server/emailContextService.ts';
 import { ExtractionQueueController } from '../src/server/extractionQueue.ts';
+import { GeminiQuotaCoordinator } from '../src/server/geminiRateLimiter.ts';
+import { extractChangeFromText, generateExplainableNarrative } from '../src/server/geminiService.ts';
 import { getGmailMessages, syncGmailMessages, type FetchLike } from '../src/server/gmailService.ts';
 import { getExtractedItems } from '../src/server/emailReviewService.ts';
+import type { ContextNode, ImpactAnalysisResult } from '../src/types/maya.ts';
 
 function makeBatchResponse(messageIds: string[], titlePrefix = 'Task'): string {
   return JSON.stringify({
@@ -90,6 +99,7 @@ async function main(): Promise<void> {
 
   const createdUserIds: string[] = [];
   const createdTokens: string[] = [];
+  const createdQuotaKeys: string[] = [];
 
   const createTestUser = (label: string) => {
     const suffix = randomUUID().slice(0, 8);
@@ -127,7 +137,7 @@ async function main(): Promise<void> {
 
       const err401 = Object.assign(new Error('401 UNAUTHORIZED API_KEY_INVALID'), { status: 401 });
       assert.equal(isRetryableGeminiError(err401), false, '401 must not be retried indefinitely');
-      console.log('PASS [1/6]: Retry-After/retryDelay parsing, retryability, and secret sanitization');
+      console.log('PASS [1/13]: Retry-After/retryDelay parsing, retryability, and secret sanitization');
     }
 
     // 2. Batching + rate limiting (virtual clock to verify exact spacing & RPM cap)
@@ -179,7 +189,7 @@ async function main(): Promise<void> {
         'Calls must respect 15,000ms spacing for 4 RPM limit',
       );
       assert.ok(sleepDurations.some((d) => d >= 15_000), 'Rate limiter must sleep between batches');
-      console.log('PASS [2/6]: Batched processing and 4 RPM sliding-window rate limiting');
+      console.log('PASS [2/13]: Batched processing and 4 RPM sliding-window rate limiting');
     }
 
     // 3. 429 & 503 backoff retries, transition to FAILED on maxRetries, and Retry Failed recovery
@@ -287,7 +297,7 @@ async function main(): Promise<void> {
         beforeRetryCompletedCount,
         'Completed message must NOT be re-processed or duplicated on retry',
       );
-      console.log('PASS [3/6]: 429/503 exponential backoff + retryDelay honoring + FAILED retry recovery');
+      console.log('PASS [3/13]: 429/503 exponential backoff + retryDelay honoring + FAILED retry recovery');
     }
 
     // 4. Partial batch failure & idempotency (no duplicate items)
@@ -355,7 +365,7 @@ async function main(): Promise<void> {
         geminiCaller: partialGemini,
       });
       assert.equal(idempotentRes.batchesExecuted, 0, 'COMPLETED messages must not be re-processed');
-      console.log('PASS [4/6]: Partial batch failure recovery and duplicate prevention');
+      console.log('PASS [4/13]: Partial batch failure recovery and duplicate prevention');
     }
 
     // 5. Decoupled Gmail Sync persistence + duplicate skip when Gemini fails
@@ -470,7 +480,7 @@ async function main(): Promise<void> {
         });
         assert.equal(secondSync.fetchedCount, 0);
         assert.equal(secondSync.skippedDuplicates, 2, 'Re-syncing same gmailMessageIds must skip duplicates');
-        console.log('PASS [5/6]: Decoupled Gmail sync persistence and duplicate email skip');
+        console.log('PASS [5/13]: Decoupled Gmail sync persistence and duplicate email skip');
       } finally {
         if (prevEncKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
         else process.env.TOKEN_ENCRYPTION_KEY = prevEncKey;
@@ -536,9 +546,1117 @@ async function main(): Promise<void> {
         method: 'POST',
       });
       assert.equal(demoRetryRes.status, 403, 'DEMO MODE must reject email-insights mutations');
-      console.log('PASS [6/6]: Workspace isolation and live HTTP API route enforcement');
+      console.log('PASS [6/13]: Workspace isolation and live HTTP API route enforcement');
+    }
+
+    // 7. Malformed-JSON batch-splitting fallback (concurrency=1 safe, isolates bad email)
+    {
+      const user = createTestUser('splitjson');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-split-good-1',
+        workspaceId: wsId,
+        gmailMessageId: 'g-split-good-1',
+        subject: 'Valid Email 1',
+        receivedAt: '2026-11-24T09:00:00Z',
+        maxRetries: 1,
+      });
+      insertTestMessage({
+        id: 'msg-split-bad',
+        workspaceId: wsId,
+        gmailMessageId: 'g-split-bad',
+        subject: 'Malformed Email',
+        receivedAt: '2026-11-24T09:01:00Z',
+        maxRetries: 1,
+      });
+      insertTestMessage({
+        id: 'msg-split-good-2',
+        workspaceId: wsId,
+        gmailMessageId: 'g-split-good-2',
+        subject: 'Valid Email 2',
+        receivedAt: '2026-11-24T09:02:00Z',
+        maxRetries: 1,
+      });
+
+      let virtualNow = 1_700_003_000_000;
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        batchSize: 5,
+        maxRetries: 1,
+        baseBackoffMs: 500,
+        maxBackoffMs: 5_000,
+        minSpacingMs: 250,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+        randomFn: () => 0.5,
+      });
+
+      let geminiCalls = 0;
+      const splitGemini: GeminiGenerateFn = async ({ contents }) => {
+        geminiCalls += 1;
+        const ids = extractBatchIdsFromPrompt(contents);
+        if (ids.includes('msg-split-bad')) {
+          return '{not-valid-json';
+        }
+        return makeBatchResponse(ids, 'SplitOK');
+      };
+
+      const pass1 = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: splitGemini,
+        awaitRetries: false,
+      });
+      assert.equal(geminiCalls, 4, '1 failed batch call + 3 isolated fallback calls expected');
+      assert.equal(pass1.completedCount, 2, 'Both valid sibling emails must complete despite bad sibling');
+      assert.equal(pass1.retryingCount, 1, 'Only the malformed email should transition to RETRYING');
+
+      // Exhaust maxRetries on the bad email alone
+      virtualNow += 10_000;
+      const pass2 = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: splitGemini,
+        awaitRetries: true,
+      });
+      assert.equal(pass2.failedCount, 1, 'Bad email must eventually transition to FAILED independently');
+
+      const msgs = getGmailMessages(wsId);
+      const statusById = new Map(msgs.map((m) => [m.id, m.extractionStatus]));
+      assert.equal(statusById.get('msg-split-good-1'), 'COMPLETED');
+      assert.equal(statusById.get('msg-split-good-2'), 'COMPLETED');
+      assert.equal(statusById.get('msg-split-bad'), 'FAILED');
+      console.log('PASS [7/13]: Malformed-JSON batch-splitting isolates bad email without deadlocking');
+    }
+
+    // 8. Startup recovery resets PROCESSING -> PENDING idempotently without duplicate workers/timers
+    {
+      const user = createTestUser('startup');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-stuck-proc',
+        workspaceId: wsId,
+        gmailMessageId: 'g-stuck-proc',
+        subject: 'Interrupted Processing Email',
+        receivedAt: '2026-11-24T10:00:00Z',
+        status: 'PROCESSING',
+      });
+
+      const bootController = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        batchSize: 5,
+      });
+
+      const firstInit = bootController.initializeOnStartup({ enqueue: false });
+      assert.ok(firstInit.recoveredCount >= 1, 'Interrupted PROCESSING message must be recovered to PENDING');
+      const [recoveredMsg] = getGmailMessages(wsId);
+      assert.equal(recoveredMsg.extractionStatus, 'PENDING');
+      assert.equal(recoveredMsg.nextRetryAt, null);
+
+      // Second call must be a strict no-op (prevents duplicate startup workers/timers)
+      const secondInit = bootController.initializeOnStartup({ enqueue: true });
+      assert.equal(secondInit.recoveredCount, 0);
+      assert.equal(secondInit.workspacesScheduled, 0);
+      console.log('PASS [8/13]: Idempotent startup recovery resets PROCESSING rows safely');
+    }
+
+    // 9. Competing Gemini features share one quota & concurrency limit without bypassing spacing
+    {
+      const user = createTestUser('compete');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-compete-1',
+        workspaceId: wsId,
+        gmailMessageId: 'g-compete-1',
+        subject: 'Competing Quota Email 1',
+        receivedAt: '2026-11-24T11:00:00Z',
+      });
+
+      let virtualNow = 1_700_004_000_000;
+      const sharedLimiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        windowMs: 60_000,
+        minSpacingMs: 15_000,
+        defaultRateLimitCooldownMs: 5_000,
+        persistToDb: false,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+        randomFn: () => 0.5,
+      });
+
+      const controller = new ExtractionQueueController({
+        batchSize: 5,
+        rateLimiter: sharedLimiter,
+      });
+
+      const callTimes: number[] = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+
+      const sampleProjects: ContextNode[] = [
+        {
+          id: 'proj-comp',
+          workspaceId: wsId,
+          type: 'PROJECT',
+          title: 'AI Research Project',
+          subtitle: '',
+          status: 'Active',
+          date: '2026-11-27',
+          ownerId: null,
+          projectId: null,
+          metadata: {},
+          provenance: 'Test',
+          factStatus: 'CONFIRMED',
+          isDemo: false,
+          createdAt: '2026-11-24T00:00:00Z',
+          updatedAt: '2026-11-24T00:00:00Z',
+        },
+      ];
+
+      const sampleAnalysis: Omit<ImpactAnalysisResult, 'aiNarrative' | 'aiStatus'> = {
+        id: 'imp-comp',
+        workspaceId: wsId,
+        changeEvent: {
+          id: 'chg-comp',
+          projectId: 'proj-comp',
+          projectTitle: 'AI Research Project',
+          targetNodeId: 'dl-comp',
+          targetNodeTitle: 'Submission Deadline',
+          fieldChanged: 'deadline',
+          originalValue: '2026-11-27',
+          newValue: '2026-11-25T17:00',
+          sourceRecordId: 'src-comp',
+          sourceRecordTitle: 'Schedule Shift',
+          extractionMethod: 'GEMINI_NLU',
+          extractionConfidenceNote: 'Test',
+          detectedAt: '2026-11-24T11:00:00Z',
+        },
+        directImpacts: [],
+        downstreamImpacts: [],
+        unaffectedItems: [],
+        explanationSummary: 'Moved to Wednesday',
+        createdAt: '2026-11-24T11:00:00Z',
+      };
+
+      const trackedBatchGemini: GeminiGenerateFn = async ({ contents }) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        callTimes.push(virtualNow);
+        await Promise.resolve();
+        inFlight -= 1;
+        return makeBatchResponse(extractBatchIdsFromPrompt(contents), 'Competing');
+      };
+
+      const trackedChangeGemini = async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        callTimes.push(virtualNow);
+        await Promise.resolve();
+        inFlight -= 1;
+        return JSON.stringify({
+          projectTitleMatch: 'AI Research Project',
+          fieldChanged: 'deadline',
+          originalDateHint: 'Friday',
+          newDateIso: '2026-11-25',
+          newTimeHint: '17:00',
+          summary: 'Moved to Wednesday',
+        });
+      };
+
+      const trackedNarrativeGemini = async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        callTimes.push(virtualNow);
+        await Promise.resolve();
+        inFlight -= 1;
+        return 'Confirmed deadline shift briefing.';
+      };
+
+      const [queueRes, changeRes, narrativeRes] = await Promise.all([
+        controller.processWorkspaceQueue(wsId, {
+          geminiCaller: trackedBatchGemini,
+          awaitRetries: true,
+        }),
+        extractChangeFromText('Urgent Update', 'Moved to Wednesday', sampleProjects, {
+          rateLimiter: sharedLimiter,
+          geminiCaller: trackedChangeGemini,
+          maxInteractiveWaitMs: Infinity,
+        }),
+        generateExplainableNarrative(sampleAnalysis, {
+          rateLimiter: sharedLimiter,
+          geminiCaller: trackedNarrativeGemini,
+          maxInteractiveWaitMs: Infinity,
+        }),
+      ]);
+
+      assert.equal(queueRes.completedCount, 1);
+      assert.equal(changeRes.usedGemini, true);
+      assert.equal(narrativeRes.aiStatus, 'USED');
+      assert.equal(maxInFlight, 1, 'Shared concurrency=1 must serialize competing Gemini features');
+      assert.equal(callTimes.length, 3, 'All 3 competing features must execute through shared limiter');
+      assert.ok(
+        callTimes[1] - callTimes[0] >= 15_000 && callTimes[2] - callTimes[1] >= 15_000,
+        `Competing calls must respect 15,000ms shared RPM spacing, got ${JSON.stringify(callTimes)}`,
+      );
+      console.log('PASS [9/13]: Competing Gemini features strictly share concurrency and RPM limits');
+    }
+
+    // 10. 429 retryDelay longer than queue maxBackoffMs is NOT truncated early
+    {
+      const user = createTestUser('long429');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-long-429',
+        workspaceId: wsId,
+        gmailMessageId: 'g-long-429',
+        subject: 'Long Quota Cooldown Email',
+        receivedAt: '2026-11-24T12:00:00Z',
+        maxRetries: 3,
+      });
+
+      let virtualNow = 1_700_005_000_000;
+      const sharedLimiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        minSpacingMs: 1_000,
+        defaultRateLimitCooldownMs: 2_000,
+        persistToDb: false,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+        randomFn: () => 0.5,
+      });
+
+      const controller = new ExtractionQueueController({
+        batchSize: 5,
+        maxRetries: 3,
+        baseBackoffMs: 2_000,
+        maxBackoffMs: 30_000, // Deliberately shorter than upstream 180s retryDelay
+        rateLimiter: sharedLimiter,
+      });
+
+      let calls = 0;
+      const pass1 = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () => {
+          calls += 1;
+          throw Object.assign(
+            new Error(
+              '{"error":{"code":429,"message":"RESOURCE_EXHAUSTED","details":[{"retryDelay":"180s"}]}}',
+            ),
+            { status: 429 },
+          );
+        },
+        awaitRetries: false,
+      });
+
+      assert.equal(calls, 1);
+      assert.equal(pass1.retryingCount, 1);
+      const [msg] = getGmailMessages(wsId);
+      assert.equal(msg.extractionStatus, 'RETRYING');
+      const scheduledDelayMs = Date.parse(msg.nextRetryAt!) - 1_700_005_000_000;
+      assert.ok(
+        scheduledDelayMs >= 180_000,
+        `Upstream 180s 429 retryDelay must NOT be truncated by maxBackoffMs=30s (got ${scheduledDelayMs}ms)`,
+      );
+      assert.ok(
+        sharedLimiter.getCooldownRemainingMs() >= 180_000,
+        'Shared limiter cooldown must honor full 180s upstream delay',
+      );
+      console.log('PASS [10/13]: 429 retryDelay longer than queue maxBackoffMs is fully respected');
+    }
+
+    // 11. 503 UNAVAILABLE uses safe backoff and succeeds on subsequent retry in geminiService & queue
+    {
+      let virtualNow = 1_700_006_000_000;
+      const sleepLog: number[] = [];
+      const sharedLimiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        minSpacingMs: 500,
+        defaultRateLimitCooldownMs: 2_000,
+        persistToDb: false,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          sleepLog.push(ms);
+          virtualNow += ms;
+        },
+        randomFn: () => 0.5,
+      });
+
+      let attempts = 0;
+      const res = await extractChangeFromText(
+        'Review Moved',
+        'Project review moved to Thursday.',
+        [],
+        {
+          rateLimiter: sharedLimiter,
+          maxTransientRetries: 2,
+          base503BackoffMs: 1_500,
+          maxInteractiveWaitMs: 30_000,
+          geminiCaller: async () => {
+            attempts += 1;
+            if (attempts === 1) {
+              throw Object.assign(new Error('503 UNAVAILABLE: overloaded'), { status: 503 });
+            }
+            return JSON.stringify({
+              projectTitleMatch: 'AI Research Project',
+              fieldChanged: 'deadline',
+              originalDateHint: 'Friday',
+              newDateIso: '2026-11-26',
+              newTimeHint: '17:00',
+              summary: 'Moved to Thursday after 503 recovery.',
+            });
+          },
+        },
+      );
+
+      assert.equal(attempts, 2, '503 error must trigger safe retry');
+      assert.equal(res.usedGemini, true, 'Subsequent retry after 503 must succeed');
+      assert.ok(
+        sleepLog.some((d) => d >= 1_500),
+        `503 retry must wait safe backoff before retrying, got ${JSON.stringify(sleepLog)}`,
+      );
+      console.log('PASS [11/13]: 503 UNAVAILABLE waits safe backoff and succeeds on retry');
+    }
+
+    // 12. Server restart restores persistent cooldown from SQLite and blocks immediate re-execution
+    {
+      const testQuotaKey = `test-restart-${randomUUID().slice(0, 8)}`;
+      createdQuotaKeys.push(testQuotaKey);
+
+      const user = createTestUser('restartcd');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-restart-cd',
+        workspaceId: wsId,
+        gmailMessageId: 'g-restart-cd',
+        subject: 'Pending Across Restart',
+        receivedAt: '2026-11-24T13:00:00Z',
+        status: 'PROCESSING',
+      });
+
+      let virtualNow = 1_700_007_000_000;
+      const preRestartLimiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        minSpacingMs: 1_000,
+        defaultRateLimitCooldownMs: 5_000,
+        persistToDb: true,
+        dbStateKey: testQuotaKey,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+      });
+
+      preRestartLimiter.recordQuotaError(
+        Object.assign(new Error('429 RESOURCE_EXHAUSTED: Please retry in 120s.'), { status: 429 }),
+      );
+      assert.ok(preRestartLimiter.getCooldownRemainingMs() >= 120_000);
+
+      // Simulate fresh server restart 10 seconds later with new instances wired to the same SQLite key
+      virtualNow += 10_000;
+      const postRestartLimiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        minSpacingMs: 1_000,
+        defaultRateLimitCooldownMs: 5_000,
+        persistToDb: true,
+        dbStateKey: testQuotaKey,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+      });
+      const postRestartQueue = new ExtractionQueueController({
+        rateLimiter: postRestartLimiter,
+      });
+
+      postRestartQueue.initializeOnStartup({ enqueue: false });
+      const remainingAfterRestart = postRestartLimiter.getCooldownRemainingMs();
+      assert.ok(
+        remainingAfterRestart >= 109_000 && remainingAfterRestart <= 110_000,
+        `Restored cooldown should reflect remaining ~110s after restart, got ${remainingAfterRestart}ms`,
+      );
+
+      let postRestartGeminiCalls = 0;
+      const restartPass = await postRestartQueue.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) => {
+          postRestartGeminiCalls += 1;
+          return makeBatchResponse(extractBatchIdsFromPrompt(contents), 'ShouldNotRunYet');
+        },
+        awaitRetries: false,
+      });
+
+      assert.equal(
+        postRestartGeminiCalls,
+        0,
+        'Restarted queue must NOT fire Gemini before restored cooldown expires',
+      );
+      assert.ok(restartPass.nextScheduledAt, 'Restarted queue must schedule wakeup at cooldown expiry');
+      console.log('PASS [12/13]: Server restart restores active global cooldown from SQLite');
+    }
+
+    // 13. Zero requests proceed before active cooldown expires; succeed once cooldown expires
+    {
+      const user = createTestUser('cdguard');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-cd-guard',
+        workspaceId: wsId,
+        gmailMessageId: 'g-cd-guard',
+        subject: 'Cooldown Guard Email',
+        receivedAt: '2026-11-24T14:00:00Z',
+      });
+
+      let virtualNow = 1_700_008_000_000;
+      const limiter = new GeminiQuotaCoordinator({
+        concurrency: 1,
+        requestsPerMinute: 4,
+        minSpacingMs: 1_000,
+        defaultRateLimitCooldownMs: 5_000,
+        persistToDb: false,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+      });
+      const controller = new ExtractionQueueController({ rateLimiter: limiter });
+
+      limiter.applyCooldownDelayMs(120_000, '429 RESOURCE_EXHAUSTED', 429);
+
+      let apiCallsBeforeExpiry = 0;
+      // Attempt at T + 10s
+      virtualNow += 10_000;
+      const changeEarly = await extractChangeFromText('Urgent', 'Deadline moved to Friday.', [], {
+        rateLimiter: limiter,
+        maxInteractiveWaitMs: 25_000,
+        geminiCaller: async () => {
+          apiCallsBeforeExpiry += 1;
+          return '{}';
+        },
+      });
+      const narrativeEarly = await generateExplainableNarrative(
+        {
+          id: 'imp-cd',
+          workspaceId: wsId,
+          changeEvent: {
+            id: 'chg-cd',
+            projectId: 'p1',
+            projectTitle: 'Proj',
+            targetNodeId: 'dl-cd',
+            targetNodeTitle: 'Deadline',
+            fieldChanged: 'deadline',
+            originalValue: '2026-11-27',
+            newValue: '2026-11-25',
+            sourceRecordId: 'src-cd',
+            sourceRecordTitle: 'Urgent',
+            extractionMethod: 'DETERMINISTIC_PARSER',
+            extractionConfidenceNote: 'Cooldown fallback',
+            detectedAt: '2026-11-24T14:00:00Z',
+          },
+          directImpacts: [],
+          downstreamImpacts: [],
+          unaffectedItems: [],
+          explanationSummary: 'Summary',
+          createdAt: '2026-11-24T14:00:00Z',
+        },
+        {
+          rateLimiter: limiter,
+          maxInteractiveWaitMs: 25_000,
+          geminiCaller: async () => {
+            apiCallsBeforeExpiry += 1;
+            return 'Should not execute';
+          },
+        },
+      );
+      await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) => {
+          apiCallsBeforeExpiry += 1;
+          return makeBatchResponse(extractBatchIdsFromPrompt(contents));
+        },
+        awaitRetries: false,
+      });
+
+      // Attempt again at T + 119s (still 1s before expiry)
+      virtualNow = 1_700_008_000_000 + 119_000;
+      const queueStillBlocked = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) => {
+          apiCallsBeforeExpiry += 1;
+          return makeBatchResponse(extractBatchIdsFromPrompt(contents));
+        },
+        awaitRetries: false,
+      });
+
+      assert.equal(changeEarly.usedGemini, false);
+      assert.equal(narrativeEarly.aiStatus, 'UNAVAILABLE');
+      assert.equal(queueStillBlocked.batchesExecuted, 0);
+      assert.equal(apiCallsBeforeExpiry, 0, 'ZERO Gemini requests may proceed before cooldown expires');
+
+      // Advance past cooldown expiry (T + 120s) -> request now executes cleanly
+      virtualNow = 1_700_008_000_000 + 120_000;
+      let callsAfterExpiry = 0;
+      const queueAfter = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) => {
+          callsAfterExpiry += 1;
+          return makeBatchResponse(extractBatchIdsFromPrompt(contents), 'PostCooldown');
+        },
+        awaitRetries: false,
+      });
+      assert.equal(callsAfterExpiry, 1);
+      assert.equal(queueAfter.completedCount, 1);
+      console.log('PASS [13/19]: Zero requests execute prior to cooldown expiry; resume once expired');
+    }
+
+    // 14. Valid Gemini structured output verifies prompt enums + responseSchema enums + LOW_SIGNAL
+    {
+      const user = createTestUser('validstruct');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-valid-rel',
+        workspaceId: wsId,
+        gmailMessageId: 'g-valid-rel',
+        subject: 'Sprint Deadline Update',
+        receivedAt: '2026-11-24T15:00:00Z',
+      });
+      insertTestMessage({
+        id: 'msg-valid-low',
+        workspaceId: wsId,
+        gmailMessageId: 'g-valid-low',
+        subject: 'Weekly Newsletter Digest',
+        receivedAt: '2026-11-24T14:55:00Z',
+      });
+
+      let capturedInstruction = '';
+      let capturedSchema: Record<string, unknown> | undefined;
+
+      const batchOut = await extractAndStageEmailBatch(
+        wsId,
+        [
+          {
+            messageRowId: 'msg-valid-rel',
+            gmailMessageId: 'g-valid-rel',
+            sender: 'Lead <lead@org.test>',
+            subject: 'Sprint Deadline Update',
+            receivedAt: '2026-11-24T15:00:00Z',
+            bodyText: 'Final sprint review is scheduled for 2026-12-01.',
+          },
+          {
+            messageRowId: 'msg-valid-low',
+            gmailMessageId: 'g-valid-low',
+            sender: 'Digest <news@example.com>',
+            subject: 'Weekly Newsletter Digest',
+            receivedAt: '2026-11-24T14:55:00Z',
+            bodyText: 'Top industry links this week.',
+          },
+        ],
+        async ({ systemInstruction, responseSchema }) => {
+          capturedInstruction = systemInstruction;
+          capturedSchema = responseSchema as Record<string, unknown>;
+          return JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-valid-rel',
+                summary: 'Sprint review scheduled on Dec 1.',
+                relevance: 'RELEVANT',
+                items: [
+                  {
+                    itemType: 'MEETING',
+                    title: 'Final Sprint Review',
+                    description: 'Scheduled final review.',
+                    proposedDate: '2026-12-01',
+                    dateAmbiguous: false,
+                    dateNote: null,
+                    assigneeOrPerson: 'Lead',
+                    relatedProjectName: null,
+                    factStatus: 'CONFIRMED',
+                    evidenceQuote: 'Final sprint review is scheduled for 2026-12-01.',
+                    confidenceNote: 'Exact date stated.',
+                  },
+                ],
+                relationships: [],
+              },
+              {
+                messageRowId: 'msg-valid-low',
+                summary: 'Automated newsletter digest.',
+                relevance: 'LOW_SIGNAL',
+                items: [],
+                relationships: [],
+              },
+            ],
+          });
+        },
+      );
+
+      assert.equal(batchOut.completedIds.length, 2);
+      assert.equal(batchOut.invalidEntries.length, 0);
+      for (const relVal of EMAIL_RELEVANCE_VALUES) {
+        assert.ok(capturedInstruction.includes(relVal), `Prompt must document relevance=${relVal}`);
+      }
+      for (const itemVal of EMAIL_EXTRACTED_ITEM_TYPES) {
+        assert.ok(capturedInstruction.includes(itemVal), `Prompt must document itemType=${itemVal}`);
+      }
+      const resultProps = (
+        ((capturedSchema?.properties as Record<string, unknown>)?.results as Record<string, unknown>)
+          ?.items as Record<string, unknown>
+      )?.properties as Record<string, unknown>;
+      assert.deepEqual((resultProps.relevance as Record<string, unknown>).enum, [...EMAIL_RELEVANCE_VALUES]);
+      assert.equal((resultProps.relevance as Record<string, unknown>).format, 'enum');
+
+      const itemProps = (
+        ((resultProps.items as Record<string, unknown>).items as Record<string, unknown>).properties
+      ) as Record<string, unknown>;
+      assert.deepEqual((itemProps.itemType as Record<string, unknown>).enum, [...EMAIL_EXTRACTED_ITEM_TYPES]);
+      assert.equal((itemProps.itemType as Record<string, unknown>).format, 'enum');
+
+      // Re-running idempotently on already COMPLETED messages does not duplicate items
+      const rerunOut = await extractAndStageEmailBatch(
+        wsId,
+        [
+          {
+            messageRowId: 'msg-valid-rel',
+            gmailMessageId: 'g-valid-rel',
+            sender: 'Lead <lead@org.test>',
+            subject: 'Sprint Deadline Update',
+            receivedAt: '2026-11-24T15:00:00Z',
+            bodyText: 'Final sprint review is scheduled for 2026-12-01.',
+          },
+        ],
+        async () =>
+          JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-valid-rel',
+                summary: 'Sprint review scheduled on Dec 1.',
+                relevance: 'RELEVANT',
+                items: [
+                  {
+                    itemType: 'MEETING',
+                    title: 'Final Sprint Review',
+                    dateAmbiguous: false,
+                    factStatus: 'CONFIRMED',
+                    evidenceQuote: 'Final sprint review is scheduled for 2026-12-01.',
+                  },
+                ],
+                relationships: [],
+              },
+            ],
+          }),
+      );
+      assert.equal(rerunOut.itemsCreated, 0, 'Idempotent re-run must not duplicate items');
+      assert.equal(getExtractedItems(wsId).length, 1);
+      console.log('PASS [14/19]: Valid structured output, prompt/schema enum alignment, and idempotency');
+    }
+
+    // 15. Invalid relevance enum fails cleanly, is non-retryable, and yields rich diagnostic
+    {
+      const user = createTestUser('badrel');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-bad-rel',
+        workspaceId: wsId,
+        gmailMessageId: 'g-bad-rel',
+        subject: 'Ambiguous Relevance Email',
+        receivedAt: '2026-11-24T15:05:00Z',
+        maxRetries: 4,
+      });
+
+      assert.throws(
+        () =>
+          parseAndValidateEmailExtraction(
+            JSON.stringify({
+              summary: 'Test',
+              relevance: 'MEDIUM_SIGNAL',
+              items: [],
+              relationships: [],
+            }),
+          ),
+        (err: unknown) => {
+          assert.ok(err instanceof GeminiSchemaValidationError);
+          assert.equal(err.invalidField, 'relevance');
+          assert.equal(isRetryableGeminiError(err), false);
+          assert.ok(err.message.includes('RELEVANT') && err.message.includes('LOW_SIGNAL'));
+          assert.ok(err.message.includes('Retryable: no'));
+          return true;
+        },
+      );
+
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 5,
+        maxRetries: 4,
+        minSpacingMs: 0,
+      });
+
+      let calls = 0;
+      const res = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () => {
+          calls += 1;
+          return JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-bad-rel',
+                summary: 'Should fail relevance enum',
+                relevance: 'MEDIUM_SIGNAL',
+                items: [],
+                relationships: [],
+              },
+            ],
+          });
+        },
+        awaitRetries: true,
+      });
+
+      assert.equal(calls, 1, 'Deterministic relevance enum mismatch must NOT retry 4 times');
+      assert.equal(res.retryingCount, 0);
+      assert.equal(res.failedCount, 1);
+      const [msg] = getGmailMessages(wsId);
+      assert.equal(msg.extractionStatus, 'FAILED');
+      assert.equal(msg.nextRetryAt, null);
+      assert.ok(msg.extractionError?.includes('msg-bad-rel'));
+      assert.ok(msg.extractionError?.includes('relevance'));
+      assert.ok(msg.extractionError?.includes('RELEVANT'));
+      assert.ok(msg.extractionError?.includes('Retryable: no'));
+      console.log('PASS [15/19]: Invalid relevance enum isolated as non-retryable FAILED with diagnostic');
+    }
+
+    // 16. Invalid itemType enum fails cleanly as non-retryable without coercing unknown labels
+    {
+      const user = createTestUser('baditem');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-bad-itemtype',
+        workspaceId: wsId,
+        gmailMessageId: 'g-bad-itemtype',
+        subject: 'Unknown Item Type Email',
+        receivedAt: '2026-11-24T15:10:00Z',
+        maxRetries: 4,
+      });
+
+      assert.throws(
+        () =>
+          parseAndValidateBatchEmailExtraction(
+            JSON.stringify({
+              results: [
+                {
+                  messageRowId: 'msg-bad-itemtype',
+                  summary: 'Bad itemType',
+                  relevance: 'RELEVANT',
+                  items: [
+                    {
+                      itemType: 'ACTION_ITEM',
+                      title: 'Follow up with vendor',
+                      dateAmbiguous: false,
+                      factStatus: 'CONFIRMED',
+                      evidenceQuote: 'Please follow up with vendor.',
+                    },
+                  ],
+                  relationships: [],
+                },
+              ],
+            }),
+          ),
+        (err: unknown) => {
+          assert.ok(err instanceof GeminiSchemaValidationError);
+          assert.equal(err.messageRowId, 'msg-bad-itemtype');
+          assert.ok(err.invalidField.endsWith('itemType'));
+          assert.equal(isRetryableGeminiError(err), false);
+          return true;
+        },
+      );
+
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 5,
+        maxRetries: 4,
+        minSpacingMs: 0,
+      });
+
+      let calls = 0;
+      const res = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () => {
+          calls += 1;
+          return JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-bad-itemtype',
+                summary: 'Invalid itemType',
+                relevance: 'RELEVANT',
+                items: [
+                  {
+                    itemType: 'ACTION_ITEM',
+                    title: 'Follow up with vendor',
+                    dateAmbiguous: false,
+                    factStatus: 'CONFIRMED',
+                    evidenceQuote: 'Please follow up with vendor.',
+                  },
+                ],
+                relationships: [],
+              },
+            ],
+          });
+        },
+        awaitRetries: true,
+      });
+
+      assert.equal(calls, 1, 'Deterministic itemType mismatch must NOT enter retry loop');
+      assert.equal(res.failedCount, 1);
+      assert.equal(getExtractedItems(wsId).length, 0, 'Invalid item must never be staged');
+      const [msg] = getGmailMessages(wsId);
+      assert.equal(msg.extractionStatus, 'FAILED');
+      assert.ok(msg.extractionError?.includes('itemType'));
+      assert.ok(msg.extractionError?.includes('PLAN_CHANGE'));
+      assert.ok(msg.extractionError?.includes('Retryable: no'));
+      console.log('PASS [16/19]: Invalid itemType enum rejected as non-retryable without silent coercion');
+    }
+
+    // 17. One invalid email inside an otherwise valid batch preserves valid siblings cleanly
+    {
+      const user = createTestUser('partialschema');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-sib-invalid',
+        workspaceId: wsId,
+        gmailMessageId: 'g-sib-invalid',
+        subject: 'Invalid Enum Email',
+        receivedAt: '2026-11-24T15:20:00Z',
+      });
+      insertTestMessage({
+        id: 'msg-sib-valid-1',
+        workspaceId: wsId,
+        gmailMessageId: 'g-sib-valid-1',
+        subject: 'Valid Sibling One',
+        receivedAt: '2026-11-24T15:19:00Z',
+      });
+      insertTestMessage({
+        id: 'msg-sib-valid-2',
+        workspaceId: wsId,
+        gmailMessageId: 'g-sib-valid-2',
+        subject: 'Valid Sibling Two',
+        receivedAt: '2026-11-24T15:18:00Z',
+      });
+
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 5,
+        maxRetries: 3,
+        minSpacingMs: 0,
+      });
+
+      let geminiCalls = 0;
+      const res = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () => {
+          geminiCalls += 1;
+          return JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-sib-invalid',
+                summary: 'Invalid entry',
+                relevance: 'HIGH_PRIORITY',
+                items: [],
+                relationships: [],
+              },
+              {
+                messageRowId: 'msg-sib-valid-1',
+                summary: 'Valid entry 1',
+                relevance: 'RELEVANT',
+                items: [
+                  {
+                    itemType: 'TASK',
+                    title: 'Valid Sibling Task 1',
+                    dateAmbiguous: false,
+                    factStatus: 'CONFIRMED',
+                    evidenceQuote: 'Complete Valid Sibling Task 1.',
+                  },
+                ],
+                relationships: [],
+              },
+              {
+                messageRowId: 'msg-sib-valid-2',
+                summary: 'Valid entry 2',
+                relevance: 'LOW_SIGNAL',
+                items: [],
+                relationships: [],
+              },
+            ],
+          });
+        },
+        awaitRetries: true,
+      });
+
+      assert.equal(geminiCalls, 1, 'Valid sibling results must be preserved in a single batch call');
+      assert.equal(res.completedCount, 2, 'Both valid siblings must complete');
+      assert.equal(res.failedCount, 1, 'Only the invalid email must fail');
+      assert.equal(res.retryingCount, 0, 'Invalid schema entry must not retry');
+
+      const statusById = new Map(getGmailMessages(wsId).map((m) => [m.id, m]));
+      assert.equal(statusById.get('msg-sib-valid-1')?.extractionStatus, 'COMPLETED');
+      assert.equal(statusById.get('msg-sib-valid-2')?.extractionStatus, 'COMPLETED');
+      assert.equal(statusById.get('msg-sib-invalid')?.extractionStatus, 'FAILED');
+      assert.ok(statusById.get('msg-sib-invalid')?.extractionError?.includes('msg-sib-invalid'));
+      assert.equal(getExtractedItems(wsId).length, 1);
+      console.log('PASS [17/19]: Partial batch schema failure isolates bad entry and preserves valid siblings');
+    }
+
+    // 18. Missing optional fields are normalized cleanly while missing mandatory evidenceQuote fails
+    {
+      const validMissingOptional = parseAndValidateEmailExtraction(
+        JSON.stringify({
+          relevance: 'RELEVANT',
+          summary: null,
+          items: [
+            {
+              itemType: 'DEADLINE',
+              title: 'Architecture Review Freeze',
+              description: null,
+              proposedDate: '',
+              dateAmbiguous: null,
+              dateNote: undefined,
+              assigneeOrPerson: null,
+              relatedProjectName: '',
+              factStatus: 'CONFIRMED',
+              evidenceQuote: 'Architecture review freeze is coming up.',
+              confidenceNote: null,
+            },
+          ],
+          relationships: [
+            {
+              sourceTitle: 'Architecture Review Freeze',
+              targetTitle: 'Core Platform',
+              relationshipType: 'BELONGS_TO',
+              rationale: 'Deadline applies to Core Platform.',
+              evidenceQuote: 'Architecture review freeze for Core Platform.',
+              factStatus: 'INFERRED',
+            },
+          ],
+        }),
+      );
+      assert.equal(validMissingOptional.summary, '');
+      assert.equal(validMissingOptional.items[0].description, '');
+      assert.equal(validMissingOptional.items[0].proposedDate, null);
+      assert.equal(validMissingOptional.items[0].dateAmbiguous, false);
+      assert.equal(validMissingOptional.relationships[0].sourceType, 'ENTITY');
+
+      const user = createTestUser('noevidence');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-no-evidence',
+        workspaceId: wsId,
+        gmailMessageId: 'g-no-evidence',
+        subject: 'Missing Evidence Quote',
+        receivedAt: '2026-11-24T15:25:00Z',
+      });
+
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 5,
+        maxRetries: 3,
+        minSpacingMs: 0,
+      });
+
+      const res = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () =>
+          JSON.stringify({
+            results: [
+              {
+                messageRowId: 'msg-no-evidence',
+                summary: 'Missing evidence quote',
+                relevance: 'RELEVANT',
+                items: [
+                  {
+                    itemType: 'TASK',
+                    title: 'Unsupported Task',
+                    dateAmbiguous: false,
+                    factStatus: 'CONFIRMED',
+                    evidenceQuote: '   ',
+                  },
+                ],
+                relationships: [],
+              },
+            ],
+          }),
+        awaitRetries: true,
+      });
+
+      assert.equal(res.completedCount, 0);
+      assert.equal(res.failedCount, 1);
+      assert.equal(getExtractedItems(wsId).length, 0);
+      const [msg] = getGmailMessages(wsId);
+      assert.equal(msg.extractionStatus, 'FAILED');
+      assert.ok(msg.extractionError?.includes('evidenceQuote'));
+      console.log('PASS [18/19]: Missing optional fields handled cleanly; missing mandatory evidenceQuote rejected');
+    }
+
+    // 19. 503 UNAVAILABLE remains retryable and recovers independently of schema validation errors
+    {
+      const user = createTestUser('503vsschema');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-503-recover',
+        workspaceId: wsId,
+        gmailMessageId: 'g-503-recover',
+        subject: 'Temporary 503 Email',
+        receivedAt: '2026-11-24T15:30:00Z',
+        maxRetries: 2,
+      });
+
+      let virtualNow = 1_700_009_000_000;
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 1,
+        maxRetries: 2,
+        baseBackoffMs: 500,
+        maxBackoffMs: 2_000,
+        minSpacingMs: 100,
+        nowFn: () => virtualNow,
+        sleepFn: async (ms) => {
+          virtualNow += ms;
+        },
+        randomFn: () => 0.5,
+      });
+
+      let attempts = 0;
+      const pass1 = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) => {
+          attempts += 1;
+          if (attempts === 1) {
+            throw Object.assign(new Error('503 UNAVAILABLE: temporary model overload'), { status: 503 });
+          }
+          return makeBatchResponse(extractBatchIdsFromPrompt(contents), 'Recovered503');
+        },
+        awaitRetries: false,
+      });
+
+      assert.equal(attempts, 1);
+      assert.equal(pass1.retryingCount, 1, '503 error must remain retryable (RETRYING)');
+      assert.equal(pass1.failedCount, 0);
+
+      virtualNow += 5_000;
+      const pass2 = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async ({ contents }) =>
+          makeBatchResponse(extractBatchIdsFromPrompt(contents), 'Recovered503'),
+        awaitRetries: false,
+      });
+      assert.equal(pass2.completedCount, 1, '503 email must recover cleanly on retry');
+      console.log('PASS [19/19]: 503 UNAVAILABLE remains retryable separately from schema validation errors');
     }
   } finally {
+    for (const qKey of createdQuotaKeys) {
+      try {
+        db.prepare('DELETE FROM gemini_quota_state WHERE id = ?').run(qKey);
+      } catch {
+        // ignore
+      }
+    }
     // Clean up all synthetic test users, workspaces, and sessions
     for (const token of createdTokens) {
       try {

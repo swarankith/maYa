@@ -1,4 +1,6 @@
 import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type {
@@ -13,11 +15,56 @@ import type {
 
 export const DEMO_WORKSPACE_ID = 'ws-demo';
 
-const DB_PATH = path.resolve(process.cwd(), 'maya_context.db');
+function isWritableSqliteTarget(targetPath: string): boolean {
+  try {
+    const dir = path.dirname(targetPath);
+    fs.accessSync(dir, fs.constants.W_OK);
+    if (fs.existsSync(targetPath)) {
+      fs.accessSync(targetPath, fs.constants.W_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+function openResilientDatabase(): { db: Database.Database; dbPath: string } {
+  const configured = process.env.MAYA_DB_PATH?.trim();
+  const primaryPath = configured
+    ? path.resolve(configured)
+    : path.resolve(process.cwd(), 'maya_context.db');
+  const fallbackPath = path.join(os.tmpdir(), 'maya_context.db');
+
+  const candidates =
+    configured || !isWritableSqliteTarget(primaryPath)
+      ? [configured ? primaryPath : fallbackPath]
+      : [primaryPath, fallbackPath];
+
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      const instance = new Database(candidate);
+      instance.pragma('journal_mode = WAL');
+      instance.pragma('foreign_keys = ON');
+      if (candidate !== primaryPath && !configured) {
+        console.warn(
+          `[db] Primary DB path (${primaryPath}) is not writable; using fallback ${candidate}.`,
+        );
+      }
+      return { db: instance, dbPath: candidate };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Unable to open writable SQLite database.');
+}
+
+const opened = openResilientDatabase();
+export const DB_PATH = opened.dbPath;
+export const db = opened.db;
 
 function hasColumn(tableName: string, columnName: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
@@ -289,6 +336,14 @@ export function initializeSchema(): void {
       created_at TEXT NOT NULL,
       FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
       FOREIGN KEY (message_row_id) REFERENCES gmail_messages(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS gemini_quota_state (
+      id TEXT PRIMARY KEY,
+      cooldown_until_ms INTEGER NOT NULL DEFAULT 0,
+      cooldown_reason TEXT,
+      last_error_code INTEGER,
+      updated_at TEXT NOT NULL
     );
   `);
 }
