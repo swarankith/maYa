@@ -55,12 +55,100 @@ const optionalBoolean = (fallback = false) =>
     z.boolean(),
   );
 
+/**
+ * Normalizes safe case/whitespace/hyphen variations of exact allowed enum tokens
+ * (e.g., "plan-change" -> "PLAN_CHANGE", "low signal" -> "LOW_SIGNAL") without
+ * silently coercing unknown categories into valid ones.
+ */
+function normalizeSafeEnumToken(v: unknown, allowed: readonly string[]): unknown {
+  if (typeof v !== 'string') return v;
+  const normalized = v.trim().toUpperCase().replace(/[\s-]+/g, '_');
+  return allowed.includes(normalized) ? normalized : v.trim();
+}
+
+/**
+ * Normalizes valid ISO-8601 date or timestamp strings (including optional seconds
+ * and timezone offsets) into YYYY-MM-DD or YYYY-MM-DDTHH:mm without inventing dates.
+ */
+export function normalizeIsoProposedDate(raw: unknown): string | null | unknown {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (trimmed === '') return null;
+
+  const dateOnlyMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (dateOnlyMatch) {
+    const [, y, m, d] = dateOnlyMatch;
+    const probe = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+    if (
+      probe.getUTCFullYear() === Number(y) &&
+      probe.getUTCMonth() === Number(m) - 1 &&
+      probe.getUTCDate() === Number(d)
+    ) {
+      return trimmed;
+    }
+    return trimmed;
+  }
+
+  const dateTimeMatch = trimmed.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/i,
+  );
+  if (dateTimeMatch) {
+    const [, y, m, d, hh, mm, ss, tz] = dateTimeMatch;
+    const monthNum = Number(m);
+    const dayNum = Number(d);
+    const hourNum = Number(hh);
+    const minNum = Number(mm);
+    const secNum = ss ? Number(ss) : 0;
+    if (
+      monthNum >= 1 &&
+      monthNum <= 12 &&
+      dayNum >= 1 &&
+      dayNum <= 31 &&
+      hourNum >= 0 &&
+      hourNum <= 23 &&
+      minNum >= 0 &&
+      minNum <= 59 &&
+      secNum >= 0 &&
+      secNum <= 59
+    ) {
+      if (tz) {
+        const normalizedTz =
+          tz.toUpperCase() === 'Z'
+            ? 'Z'
+            : tz.includes(':')
+              ? tz
+              : `${tz.slice(0, 3)}:${tz.slice(3)}`;
+        const isoCandidate = `${y}-${m}-${d}T${hh}:${mm}:${ss ?? '00'}${normalizedTz}`;
+        const parsedMs = Date.parse(isoCandidate);
+        if (Number.isFinite(parsedMs)) {
+          return new Date(parsedMs).toISOString().slice(0, 16);
+        }
+      } else {
+        const probe = new Date(Date.UTC(Number(y), monthNum - 1, dayNum));
+        if (
+          probe.getUTCFullYear() === Number(y) &&
+          probe.getUTCMonth() === monthNum - 1 &&
+          probe.getUTCDate() === dayNum
+        ) {
+          return `${y}-${m}-${d}T${hh}:${mm}`;
+        }
+      }
+    }
+  }
+
+  return trimmed;
+}
+
 const ExtractedEmailItemSchema = z.object({
-  itemType: z.enum(EMAIL_EXTRACTED_ITEM_TYPES),
+  itemType: z.preprocess(
+    (v) => normalizeSafeEnumToken(v, EMAIL_EXTRACTED_ITEM_TYPES),
+    z.enum(EMAIL_EXTRACTED_ITEM_TYPES),
+  ),
   title: z.string().trim().min(1, 'Mandatory title is required.').max(220),
   description: optionalText(1000, ''),
   proposedDate: z.preprocess(
-    (v) => (v === undefined || v === null || (typeof v === 'string' && v.trim() === '') ? null : v),
+    normalizeIsoProposedDate,
     z
       .string()
       .trim()
@@ -71,7 +159,10 @@ const ExtractedEmailItemSchema = z.object({
   dateNote: nullableOptionalText(300),
   assigneeOrPerson: nullableOptionalText(160),
   relatedProjectName: nullableOptionalText(200),
-  factStatus: z.enum(EMAIL_FACT_STATUS_VALUES),
+  factStatus: z.preprocess(
+    (v) => normalizeSafeEnumToken(v, EMAIL_FACT_STATUS_VALUES),
+    z.enum(EMAIL_FACT_STATUS_VALUES),
+  ),
   evidenceQuote: z.string().trim().min(1, 'Mandatory evidenceQuote is required.').max(600),
   confidenceNote: optionalText(400, ''),
 });
@@ -81,15 +172,24 @@ const SuggestedRelationshipSchema = z.object({
   sourceType: optionalText(40, 'ENTITY'),
   targetTitle: z.string().trim().min(1, 'Mandatory targetTitle is required.').max(220),
   targetType: optionalText(40, 'ENTITY'),
-  relationshipType: z.enum(EMAIL_RELATIONSHIP_TYPES),
+  relationshipType: z.preprocess(
+    (v) => normalizeSafeEnumToken(v, EMAIL_RELATIONSHIP_TYPES),
+    z.enum(EMAIL_RELATIONSHIP_TYPES),
+  ),
   rationale: z.string().trim().min(1, 'Mandatory rationale is required.').max(500),
   evidenceQuote: z.string().trim().min(1, 'Mandatory evidenceQuote is required.').max(600),
-  factStatus: z.enum(EMAIL_FACT_STATUS_VALUES),
+  factStatus: z.preprocess(
+    (v) => normalizeSafeEnumToken(v, EMAIL_FACT_STATUS_VALUES),
+    z.enum(EMAIL_FACT_STATUS_VALUES),
+  ),
 });
 
 export const ExtractedEmailContextSchema = z.object({
   summary: optionalText(600, ''),
-  relevance: z.enum(EMAIL_RELEVANCE_VALUES),
+  relevance: z.preprocess(
+    (v) => normalizeSafeEnumToken(v, EMAIL_RELEVANCE_VALUES),
+    z.enum(EMAIL_RELEVANCE_VALUES),
+  ),
   items: z.preprocess(
     (v) => (v === null || v === undefined ? [] : v),
     z.array(ExtractedEmailItemSchema).max(20),
@@ -238,6 +338,13 @@ const BATCH_RESPONSE_SCHEMA = {
   },
   required: ['results'],
 };
+
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+
+export function getConfiguredGeminiModel(): string {
+  const configured = process.env.GEMINI_MODEL?.trim();
+  return configured && configured.length > 0 ? configured : DEFAULT_GEMINI_MODEL;
+}
 
 export function hasConfiguredGeminiApiKey(): boolean {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -489,7 +596,7 @@ export function sanitizeExtractionError(err: unknown): string {
   if (status === 429 || upper.includes('RESOURCE_EXHAUSTED') || upper.includes('RATE LIMIT')) {
     const delayMs = parseRetryDelayMs(err);
     const delayNote = delayMs ? ` Retry window ~${Math.ceil(delayMs / 1000)}s.` : '';
-    return `Gemini rate limit reached (429 RESOURCE_EXHAUSTED on gemini-4-hydrogen).${delayNote}`;
+    return `Gemini rate limit reached (429 RESOURCE_EXHAUSTED on ${getConfiguredGeminiModel()}).${delayNote}`;
   }
   if (status === 503 || upper.includes('UNAVAILABLE') || upper.includes('OVERLOAD')) {
     return 'Gemini model temporarily unavailable (503 UNAVAILABLE).';
@@ -737,11 +844,25 @@ export function parseAndValidateBatchEntriesIndividually(
     );
   }
 
-  if (!rawObj || typeof rawObj !== 'object' || !Array.isArray((rawObj as Record<string, unknown>).results)) {
+  let rawResults: unknown[];
+  if (rawObj && typeof rawObj === 'object' && Array.isArray((rawObj as Record<string, unknown>).results)) {
+    rawResults = (rawObj as { results: unknown[] }).results;
+  } else if (
+    messages.length === 1 &&
+    rawObj &&
+    typeof rawObj === 'object' &&
+    !Array.isArray(rawObj) &&
+    ('relevance' in rawObj || 'items' in rawObj)
+  ) {
+    rawResults = [
+      {
+        messageRowId: messages[0].messageRowId,
+        ...(rawObj as Record<string, unknown>),
+      },
+    ];
+  } else {
     throw new Error('Gemini batch extraction response is missing "results" array.');
   }
-
-  const rawResults = (rawObj as { results: unknown[] }).results;
   const msgById = new Map(messages.map((m) => [m.messageRowId, m]));
   const seenIds = new Set<string>();
   const validEntries: Array<ValidatedEmailContext & { messageRowId: string }> = [];
@@ -1188,7 +1309,7 @@ export async function extractAndStageEmailBatch(
   ].join('\n\n');
 
   const rawText = await caller({
-    model: 'gemini-4-hydrogen',
+    model: getConfiguredGeminiModel(),
     contents: promptContents,
     systemInstruction,
     responseSchema: BATCH_RESPONSE_SCHEMA,

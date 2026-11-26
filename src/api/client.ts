@@ -22,21 +22,40 @@ import type {
   WorkspaceMode,
 } from '../types/maya.ts';
 
+function readCookie(name: string): string | null {
+  if (typeof document === 'undefined' || !document.cookie) return null;
+  const prefix = `${encodeURIComponent(name)}=`;
+  for (const part of document.cookie.split(';')) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(prefix)) {
+      return decodeURIComponent(trimmed.slice(prefix.length));
+    }
+  }
+  return null;
+}
+
 async function requestJson<T>(
   url: string,
   init?: RequestInit,
   token?: string | null,
 ): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...((init?.headers as Record<string, string>) ?? {}),
   };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
+  } else if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    const csrfToken = readCookie('maya_csrf');
+    if (csrfToken) {
+      headers['X-CSRF-Token'] = csrfToken;
+    }
   }
 
   const res = await fetch(url, {
     ...init,
+    credentials: 'include',
     headers,
   });
   const data = (await res.json()) as T & { error?: string };
@@ -63,10 +82,10 @@ export const authApi = {
       body: JSON.stringify(payload),
     }),
 
-  logout: (token: string | null) =>
+  logout: (token?: string | null) =>
     requestJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }, token),
 
-  me: (token: string) =>
+  me: (token?: string | null) =>
     requestJson<{ user: UserProfile; workspace: WorkspaceInfo }>('/api/auth/me', {}, token),
 };
 

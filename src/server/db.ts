@@ -28,27 +28,55 @@ function isWritableSqliteTarget(targetPath: string): boolean {
   }
 }
 
-function openResilientDatabase(): { db: Database.Database; dbPath: string } {
-  const configured = process.env.MAYA_DB_PATH?.trim();
+export function resolveSqliteDatabaseCandidates(options?: {
+  configuredPath?: string;
+  nodeEnv?: string;
+  cwd?: string;
+}): { primaryPath: string; candidates: string[]; allowTempFallback: boolean } {
+  const configured = (options?.configuredPath ?? process.env.MAYA_DB_PATH)?.trim();
+  const isProduction = (options?.nodeEnv ?? process.env.NODE_ENV) === 'production';
+  const cwd = options?.cwd ?? process.cwd();
   const primaryPath = configured
     ? path.resolve(configured)
-    : path.resolve(process.cwd(), 'maya_context.db');
+    : path.resolve(cwd, 'maya_context.db');
   const fallbackPath = path.join(os.tmpdir(), 'maya_context.db');
 
-  const candidates =
-    configured || !isWritableSqliteTarget(primaryPath)
-      ? [configured ? primaryPath : fallbackPath]
-      : [primaryPath, fallbackPath];
+  // Production or explicitly configured MAYA_DB_PATH must fail fast instead of silently
+  // falling back to ephemeral os.tmpdir() storage.
+  if (configured || isProduction) {
+    return {
+      primaryPath,
+      candidates: [primaryPath],
+      allowTempFallback: false,
+    };
+  }
+
+  const candidates = isWritableSqliteTarget(primaryPath)
+    ? [primaryPath, fallbackPath]
+    : [fallbackPath];
+  return {
+    primaryPath,
+    candidates,
+    allowTempFallback: true,
+  };
+}
+
+function openResilientDatabase(): { db: Database.Database; dbPath: string } {
+  const { primaryPath, candidates, allowTempFallback } = resolveSqliteDatabaseCandidates();
 
   let lastError: unknown;
   for (const candidate of candidates) {
+    if (!isWritableSqliteTarget(candidate)) {
+      lastError = new Error(`SQLite target path is not writable: ${candidate}`);
+      continue;
+    }
     try {
       const instance = new Database(candidate);
       instance.pragma('journal_mode = WAL');
       instance.pragma('foreign_keys = ON');
-      if (candidate !== primaryPath && !configured) {
+      if (candidate !== primaryPath && allowTempFallback) {
         console.warn(
-          `[db] Primary DB path (${primaryPath}) is not writable; using fallback ${candidate}.`,
+          `[db] [DEV-ONLY] Primary DB path (${primaryPath}) is not writable; using temporary fallback ${candidate}.`,
         );
       }
       return { db: instance, dbPath: candidate };
@@ -57,9 +85,10 @@ function openResilientDatabase(): { db: Database.Database; dbPath: string } {
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('Unable to open writable SQLite database.');
+  const reason = lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown error');
+  throw new Error(
+    `[db] Fatal: Unable to open persistent SQLite database at "${primaryPath}" (${reason}). Configure a writable MAYA_DB_PATH.`,
+  );
 }
 
 const opened = openResilientDatabase();
@@ -116,7 +145,8 @@ export function initializeSchema(): void {
       fact_status TEXT NOT NULL DEFAULT 'CONFIRMED',
       is_demo INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -132,6 +162,7 @@ export function initializeSchema(): void {
       fact_status TEXT NOT NULL DEFAULT 'CONFIRMED',
       is_demo INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
       FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
       FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
     );
@@ -147,7 +178,8 @@ export function initializeSchema(): void {
       received_at TEXT NOT NULL,
       parsed_entities_json TEXT NOT NULL DEFAULT '{}',
       is_demo INTEGER NOT NULL DEFAULT 0,
-      processed INTEGER NOT NULL DEFAULT 1
+      processed INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS impact_analyses (
@@ -160,7 +192,8 @@ export function initializeSchema(): void {
       explanation_summary TEXT NOT NULL,
       ai_narrative TEXT,
       ai_status TEXT NOT NULL DEFAULT 'SKIPPED',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS what_if_plans (
@@ -178,6 +211,7 @@ export function initializeSchema(): void {
       tradeoffs_json TEXT NOT NULL,
       requires_confirmation_json TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'PROPOSED',
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
       FOREIGN KEY (analysis_id) REFERENCES impact_analyses(id) ON DELETE CASCADE
     );
 
@@ -200,7 +234,8 @@ export function initializeSchema(): void {
       execution_mode TEXT NOT NULL DEFAULT 'SIMULATED_DEMO',
       decided_at TEXT,
       decision_note TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -229,7 +264,8 @@ export function initializeSchema(): void {
       granted_scopes_json TEXT NOT NULL DEFAULT '[]',
       last_sync_at TEXT,
       setup_instructions_json TEXT NOT NULL,
-      UNIQUE(workspace_id, service_key)
+      UNIQUE(workspace_id, service_key),
+      FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS oauth_states (
@@ -345,7 +381,355 @@ export function initializeSchema(): void {
       last_error_code INTEGER,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      details TEXT NOT NULL DEFAULT '',
+      applied_at TEXT NOT NULL
+    );
   `);
+}
+
+function hasWorkspaceCascadeFk(tableName: string): boolean {
+  const fks = db.prepare(`PRAGMA foreign_key_list(${tableName})`).all() as Array<{
+    table: string;
+    from: string;
+    on_delete: string;
+  }>;
+  return fks.some(
+    (fk) =>
+      fk.table === 'workspaces' &&
+      fk.from === 'workspace_id' &&
+      fk.on_delete.toUpperCase() === 'CASCADE',
+  );
+}
+
+/**
+ * Versioned, idempotent migration (v1): adds ON DELETE CASCADE workspace_id foreign keys
+ * to pre-existing workspace-owned tables ONLY when zero orphaned rows exist.
+ * Never deletes user data or orphaned rows, and intentionally preserves audit_logs without cascade.
+ */
+export function applyVersionedMigrations(targetDb: Database.Database = db): {
+  version: number;
+  status: string;
+  migratedTables: string[];
+  skippedTables: string[];
+} {
+  const MIGRATION_VERSION = 1;
+  const MIGRATION_NAME = 'workspace_fk_cascade_v1';
+
+  const existing = targetDb
+    .prepare('SELECT version, status FROM schema_migrations WHERE version = ?')
+    .get(MIGRATION_VERSION) as { version: number; status: string } | undefined;
+  if (existing && existing.status === 'APPLIED') {
+    return { version: MIGRATION_VERSION, status: 'ALREADY_APPLIED', migratedTables: [], skippedTables: [] };
+  }
+
+  const specs: Array<{
+    table: string;
+    ddl: string;
+    columns: Array<{ name: string; fallbackExpr?: string }>;
+    indexes: string[];
+  }> = [
+    {
+      table: 'nodes',
+      ddl: `CREATE TABLE nodes_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', type TEXT NOT NULL,
+        title TEXT NOT NULL, subtitle TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'Active',
+        date TEXT, owner_id TEXT, project_id TEXT, metadata_json TEXT NOT NULL DEFAULT '{}',
+        provenance TEXT NOT NULL, fact_status TEXT NOT NULL DEFAULT 'CONFIRMED',
+        is_demo INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'type' },
+        { name: 'title' },
+        { name: 'subtitle', fallbackExpr: "COALESCE(subtitle, '')" },
+        { name: 'status', fallbackExpr: "COALESCE(status, 'Active')" },
+        { name: 'date' },
+        { name: 'owner_id' },
+        { name: 'project_id' },
+        { name: 'metadata_json', fallbackExpr: "COALESCE(metadata_json, '{}')" },
+        { name: 'provenance', fallbackExpr: "COALESCE(provenance, 'Legacy Context')" },
+        { name: 'fact_status', fallbackExpr: "COALESCE(fact_status, 'CONFIRMED')" },
+        { name: 'is_demo', fallbackExpr: 'COALESCE(is_demo, 0)' },
+        { name: 'created_at' },
+        { name: 'updated_at' },
+      ],
+      indexes: [
+        'CREATE INDEX IF NOT EXISTS idx_nodes_ws ON nodes(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_nodes_ws_type ON nodes(workspace_id, type)',
+      ],
+    },
+    {
+      table: 'edges',
+      ddl: `CREATE TABLE edges_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL, relationship_type TEXT NOT NULL, label TEXT NOT NULL,
+        provenance TEXT NOT NULL, evidence_text TEXT NOT NULL DEFAULT '', source_record_id TEXT,
+        fact_status TEXT NOT NULL DEFAULT 'CONFIRMED', is_demo INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+        FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+        FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'source_id' },
+        { name: 'target_id' },
+        { name: 'relationship_type' },
+        { name: 'label' },
+        { name: 'provenance', fallbackExpr: "COALESCE(provenance, 'Legacy Link')" },
+        { name: 'evidence_text', fallbackExpr: "COALESCE(evidence_text, '')" },
+        { name: 'source_record_id' },
+        { name: 'fact_status', fallbackExpr: "COALESCE(fact_status, 'CONFIRMED')" },
+        { name: 'is_demo', fallbackExpr: 'COALESCE(is_demo, 0)' },
+        { name: 'created_at' },
+      ],
+      indexes: [
+        'CREATE INDEX IF NOT EXISTS idx_edges_ws ON edges(workspace_id)',
+        'CREATE INDEX IF NOT EXISTS idx_edges_ws_src ON edges(workspace_id, source_id)',
+        'CREATE INDEX IF NOT EXISTS idx_edges_ws_tgt ON edges(workspace_id, target_id)',
+      ],
+    },
+    {
+      table: 'source_records',
+      ddl: `CREATE TABLE source_records_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', source_type TEXT NOT NULL,
+        external_id TEXT, sender TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+        received_at TEXT NOT NULL, parsed_entities_json TEXT NOT NULL DEFAULT '{}',
+        is_demo INTEGER NOT NULL DEFAULT 0, processed INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'source_type' },
+        { name: 'external_id' },
+        { name: 'sender' },
+        { name: 'title' },
+        { name: 'content' },
+        { name: 'received_at' },
+        { name: 'parsed_entities_json', fallbackExpr: "COALESCE(parsed_entities_json, '{}')" },
+        { name: 'is_demo', fallbackExpr: 'COALESCE(is_demo, 0)' },
+        { name: 'processed', fallbackExpr: 'COALESCE(processed, 1)' },
+      ],
+      indexes: ['CREATE INDEX IF NOT EXISTS idx_sources_ws ON source_records(workspace_id)'],
+    },
+    {
+      table: 'impact_analyses',
+      ddl: `CREATE TABLE impact_analyses_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo',
+        change_event_json TEXT NOT NULL, direct_impacts_json TEXT NOT NULL,
+        downstream_impacts_json TEXT NOT NULL, unaffected_items_json TEXT NOT NULL,
+        explanation_summary TEXT NOT NULL, ai_narrative TEXT,
+        ai_status TEXT NOT NULL DEFAULT 'SKIPPED', created_at TEXT NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'change_event_json', fallbackExpr: "COALESCE(change_event_json, '{}')" },
+        { name: 'direct_impacts_json', fallbackExpr: "COALESCE(direct_impacts_json, '[]')" },
+        { name: 'downstream_impacts_json', fallbackExpr: "COALESCE(downstream_impacts_json, '[]')" },
+        { name: 'unaffected_items_json', fallbackExpr: "COALESCE(unaffected_items_json, '[]')" },
+        {
+          name: 'explanation_summary',
+          fallbackExpr:
+            "COALESCE(NULLIF(TRIM(explanation_summary), ''), NULLIF(TRIM(ai_narrative), ''), 'Legacy impact analysis record (summary unavailable).')",
+        },
+        { name: 'ai_narrative' },
+        { name: 'ai_status', fallbackExpr: "COALESCE(NULLIF(TRIM(ai_status), ''), 'SKIPPED')" },
+        { name: 'created_at' },
+      ],
+      indexes: ['CREATE INDEX IF NOT EXISTS idx_analyses_ws ON impact_analyses(workspace_id)'],
+    },
+    {
+      table: 'what_if_plans',
+      ddl: `CREATE TABLE what_if_plans_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', analysis_id TEXT NOT NULL,
+        option_key TEXT NOT NULL, title TEXT NOT NULL, strategy_summary TEXT NOT NULL,
+        proposed_changes_json TEXT NOT NULL, tasks_affected_json TEXT NOT NULL,
+        meetings_affected_json TEXT NOT NULL, potential_conflicts_json TEXT NOT NULL,
+        advantages_json TEXT NOT NULL, tradeoffs_json TEXT NOT NULL,
+        requires_confirmation_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PROPOSED',
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+        FOREIGN KEY (analysis_id) REFERENCES impact_analyses(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'analysis_id' },
+        { name: 'option_key' },
+        { name: 'title' },
+        { name: 'strategy_summary', fallbackExpr: "COALESCE(strategy_summary, '')" },
+        { name: 'proposed_changes_json', fallbackExpr: "COALESCE(proposed_changes_json, '[]')" },
+        { name: 'tasks_affected_json', fallbackExpr: "COALESCE(tasks_affected_json, '[]')" },
+        { name: 'meetings_affected_json', fallbackExpr: "COALESCE(meetings_affected_json, '[]')" },
+        { name: 'potential_conflicts_json', fallbackExpr: "COALESCE(potential_conflicts_json, '[]')" },
+        { name: 'advantages_json', fallbackExpr: "COALESCE(advantages_json, '[]')" },
+        { name: 'tradeoffs_json', fallbackExpr: "COALESCE(tradeoffs_json, '[]')" },
+        { name: 'requires_confirmation_json', fallbackExpr: "COALESCE(requires_confirmation_json, '[]')" },
+        { name: 'status', fallbackExpr: "COALESCE(status, 'PROPOSED')" },
+      ],
+      indexes: ['CREATE INDEX IF NOT EXISTS idx_plans_ws ON what_if_plans(workspace_id)'],
+    },
+    {
+      table: 'approvals',
+      ddl: `CREATE TABLE approvals_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', plan_id TEXT NOT NULL,
+        option_key TEXT NOT NULL, action_type TEXT NOT NULL, target_node_id TEXT NOT NULL,
+        target_label TEXT NOT NULL, permission_scope TEXT NOT NULL,
+        permission_valid INTEGER NOT NULL DEFAULT 1, permission_reason TEXT NOT NULL,
+        proposed_payload_json TEXT NOT NULL, before_state_json TEXT NOT NULL,
+        after_state_json TEXT NOT NULL, rationale TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING', execution_mode TEXT NOT NULL DEFAULT 'SIMULATED_DEMO',
+        decided_at TEXT, decision_note TEXT, created_at TEXT NOT NULL,
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'plan_id' },
+        { name: 'option_key' },
+        { name: 'action_type' },
+        { name: 'target_node_id' },
+        { name: 'target_label' },
+        { name: 'permission_scope' },
+        { name: 'permission_valid', fallbackExpr: 'COALESCE(permission_valid, 1)' },
+        { name: 'permission_reason', fallbackExpr: "COALESCE(permission_reason, '')" },
+        { name: 'proposed_payload_json', fallbackExpr: "COALESCE(proposed_payload_json, '{}')" },
+        { name: 'before_state_json', fallbackExpr: "COALESCE(before_state_json, '{}')" },
+        { name: 'after_state_json', fallbackExpr: "COALESCE(after_state_json, '{}')" },
+        { name: 'rationale', fallbackExpr: "COALESCE(rationale, '')" },
+        { name: 'status', fallbackExpr: "COALESCE(status, 'PENDING')" },
+        { name: 'execution_mode', fallbackExpr: "COALESCE(execution_mode, 'SIMULATED_DEMO')" },
+        { name: 'decided_at' },
+        { name: 'decision_note' },
+        { name: 'created_at' },
+      ],
+      indexes: ['CREATE INDEX IF NOT EXISTS idx_approvals_ws ON approvals(workspace_id)'],
+    },
+    {
+      table: 'integrations',
+      ddl: `CREATE TABLE integrations_v2 (
+        id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT 'ws-demo', service_key TEXT NOT NULL,
+        name TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'DISCONNECTED',
+        execution_policy TEXT NOT NULL, required_scopes_json TEXT NOT NULL,
+        granted_scopes_json TEXT NOT NULL DEFAULT '[]', last_sync_at TEXT,
+        setup_instructions_json TEXT NOT NULL, UNIQUE(workspace_id, service_key),
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+      )`,
+      columns: [
+        { name: 'id' },
+        { name: 'workspace_id', fallbackExpr: "COALESCE(NULLIF(TRIM(workspace_id), ''), 'ws-demo')" },
+        { name: 'service_key' },
+        { name: 'name' },
+        { name: 'description' },
+        { name: 'status', fallbackExpr: "COALESCE(status, 'DISCONNECTED')" },
+        { name: 'execution_policy' },
+        { name: 'required_scopes_json', fallbackExpr: "COALESCE(required_scopes_json, '[]')" },
+        { name: 'granted_scopes_json', fallbackExpr: "COALESCE(granted_scopes_json, '[]')" },
+        { name: 'last_sync_at' },
+        { name: 'setup_instructions_json', fallbackExpr: "COALESCE(setup_instructions_json, '[]')" },
+      ],
+      indexes: ['CREATE INDEX IF NOT EXISTS idx_integrations_ws ON integrations(workspace_id)'],
+    },
+  ];
+
+  const migratedTables: string[] = [];
+  const skippedTables: string[] = [];
+
+  targetDb.pragma('foreign_keys = OFF');
+  try {
+    const tx = targetDb.transaction(() => {
+      for (const spec of specs) {
+        const fks = targetDb.prepare(`PRAGMA foreign_key_list(${spec.table})`).all() as Array<{
+          table: string;
+          from: string;
+          on_delete: string;
+        }>;
+        const alreadyHasFk = fks.some(
+          (fk) =>
+            fk.table === 'workspaces' &&
+            fk.from === 'workspace_id' &&
+            fk.on_delete.toUpperCase() === 'CASCADE',
+        );
+        if (alreadyHasFk) continue;
+
+        const orphanRow = targetDb
+          .prepare(
+            `SELECT COUNT(*) AS cnt FROM ${spec.table} t LEFT JOIN workspaces w ON t.workspace_id = w.id WHERE w.id IS NULL`,
+          )
+          .get() as { cnt: number };
+
+        if (orphanRow.cnt > 0) {
+          skippedTables.push(`${spec.table}(${orphanRow.cnt} orphans)`);
+          continue;
+        }
+
+        const existingCols = new Set(
+          (targetDb.prepare(`PRAGMA table_info(${spec.table})`).all() as Array<{ name: string }>).map(
+            (c) => c.name,
+          ),
+        );
+        const targetColNames = spec.columns.map((c) => c.name);
+        const selectExprs = spec.columns.map((c) => {
+          if (c.name === 'explanation_summary' && !existingCols.has('explanation_summary')) {
+            return existingCols.has('ai_narrative')
+              ? "COALESCE(NULLIF(TRIM(ai_narrative), ''), 'Legacy impact analysis record (summary unavailable).')"
+              : "'Legacy impact analysis record (summary unavailable).'";
+          }
+          if (!existingCols.has(c.name)) {
+            return 'NULL';
+          }
+          return c.fallbackExpr ?? c.name;
+        });
+
+        targetDb.exec(spec.ddl);
+        targetDb.exec(
+          `INSERT INTO ${spec.table}_v2 (${targetColNames.join(', ')}) SELECT ${selectExprs.join(', ')} FROM ${spec.table}`,
+        );
+        targetDb.exec(`DROP TABLE ${spec.table}`);
+        targetDb.exec(`ALTER TABLE ${spec.table}_v2 RENAME TO ${spec.table}`);
+        for (const idx of spec.indexes) {
+          targetDb.exec(idx);
+        }
+        migratedTables.push(spec.table);
+      }
+
+      const fkViolations = targetDb.prepare('PRAGMA foreign_key_check').all() as unknown[];
+      if (fkViolations.length > 0) {
+        throw new Error(`Foreign key check failed after migration (${fkViolations.length} violations).`);
+      }
+
+      const finalStatus = skippedTables.length > 0 ? 'PARTIAL_ORPHANS_PRESERVED' : 'APPLIED';
+      targetDb
+        .prepare(
+          `INSERT INTO schema_migrations (version, name, status, details, applied_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(version) DO UPDATE SET status = excluded.status, details = excluded.details, applied_at = excluded.applied_at`,
+        )
+        .run(
+          MIGRATION_VERSION,
+          MIGRATION_NAME,
+          finalStatus,
+          JSON.stringify({ migratedTables, skippedTables }),
+          new Date().toISOString(),
+        );
+    });
+    tx();
+  } finally {
+    targetDb.pragma('foreign_keys = ON');
+  }
+
+  const finalStatus = skippedTables.length > 0 ? 'PARTIAL_ORPHANS_PRESERVED' : 'APPLIED';
+  return { version: MIGRATION_VERSION, status: finalStatus, migratedTables, skippedTables };
 }
 
 /**
@@ -1749,6 +2133,7 @@ export function resetAndSeedDemoData(): void {
 export function initializeDatabase(): void {
   initializeSchema();
   migrateSchemaToMultiTenant();
+  applyVersionedMigrations();
   seedWorkspaceIntegrations(DEMO_WORKSPACE_ID);
 
   const demoCount = db

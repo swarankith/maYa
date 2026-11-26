@@ -57,7 +57,8 @@ const NAV_ITEMS: Array<{
 
 export default function App() {
   const [mode, setMode] = useState<WorkspaceMode>('PERSONAL');
-  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [restoringSession, setRestoringSession] = useState(true);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
 
@@ -87,11 +88,38 @@ export default function App() {
   }, []);
 
   const workspaceApi = useMemo(
-    () => createWorkspaceApi(mode, authToken),
-    [mode, authToken],
+    () => createWorkspaceApi(mode, null),
+    [mode],
   );
 
-  const isActiveSession = mode === 'DEMO' || Boolean(authToken);
+  const isActiveSession = mode === 'DEMO' || isAuthenticated;
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const session = await authApi.me();
+        if (!cancelled) {
+          setUser(session.user);
+          setWorkspace(session.workspace);
+          setIsAuthenticated(true);
+        }
+      } catch {
+        if (!cancelled) {
+          setIsAuthenticated(false);
+          setUser(null);
+          setWorkspace(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setRestoringSession(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshAll = useCallback(async () => {
     if (!isActiveSession) {
@@ -118,7 +146,7 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to synchronize context state';
       if (mode === 'PERSONAL' && /authentication|session|expired|401/i.test(msg)) {
-        setAuthToken(null);
+        setIsAuthenticated(false);
         setUser(null);
         setWorkspace(null);
         clearWorkspaceCache();
@@ -141,7 +169,7 @@ export default function App() {
 
   const handleAuthenticated = (session: AuthSessionResponse) => {
     clearWorkspaceCache();
-    setAuthToken(session.token);
+    setIsAuthenticated(true);
     setUser(session.user);
     setWorkspace(session.workspace);
     setMode('PERSONAL');
@@ -165,17 +193,17 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    const tokenToRevoke = authToken;
-    setAuthToken(null);
+    const hadSession = isAuthenticated;
+    setIsAuthenticated(false);
     setUser(null);
     setWorkspace(null);
     setMode('PERSONAL');
     setActiveTab('dashboard');
     setMobileMenuOpen(false);
     clearWorkspaceCache();
-    if (tokenToRevoke) {
+    if (hadSession) {
       try {
-        await authApi.logout(tokenToRevoke);
+        await authApi.logout();
       } catch {
         // Ignore network errors during logout cleanup
       }
@@ -213,7 +241,15 @@ export default function App() {
     }
   };
 
-  if (mode === 'PERSONAL' && !authToken) {
+  if (mode === 'PERSONAL' && restoringSession) {
+    return (
+      <div className="min-h-screen bg-[#070D19] text-slate-300 flex items-center justify-center p-6 text-sm">
+        Restoring secure workspace session...
+      </div>
+    );
+  }
+
+  if (mode === 'PERSONAL' && !isAuthenticated) {
     return (
       <AuthPage onAuthenticated={handleAuthenticated} onEnterDemoMode={handleEnterDemoMode} />
     );
@@ -313,7 +349,7 @@ export default function App() {
               : workspace?.name ?? 'Private isolated SQLite context.'}
           </p>
 
-          {authToken ? (
+          {isAuthenticated ? (
             <button
               type="button"
               onClick={() => handleSwitchMode(mode === 'DEMO' ? 'PERSONAL' : 'DEMO')}

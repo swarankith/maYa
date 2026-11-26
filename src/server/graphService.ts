@@ -254,6 +254,19 @@ export function createEdge(
     }
   }
 
+  const duplicateEdge = db
+    .prepare(
+      'SELECT id FROM edges WHERE workspace_id = ? AND source_id = ? AND target_id = ? AND relationship_type = ?',
+    )
+    .get(workspaceId, input.sourceId, input.targetId, input.relationshipType) as
+    | { id: string }
+    | undefined;
+  if (duplicateEdge) {
+    throw new Error(
+      `A ${input.relationshipType} relationship between "${sourceNode.title}" and "${targetNode.title}" already exists in your workspace.`,
+    );
+  }
+
   const now = new Date().toISOString();
   const isDemo = workspaceId === DEMO_WORKSPACE_ID;
   const id = `edge-${randomUUID().slice(0, 10)}`;

@@ -450,31 +450,39 @@ export function acceptSuggestedRelationship(
     );
   }
 
-  const edgeId = `edge-${randomUUID().slice(0, 10)}`;
-  const now = new Date().toISOString();
   const relType = String(row.relationship_type) as RelationshipType;
+  const existingEdge = db
+    .prepare(
+      'SELECT id FROM edges WHERE workspace_id = ? AND source_id = ? AND target_id = ? AND relationship_type = ?',
+    )
+    .get(workspaceId, sourceNode.id, targetNode.id, relType) as { id: string } | undefined;
+
+  const edgeId = existingEdge?.id ?? `edge-${randomUUID().slice(0, 10)}`;
+  const now = new Date().toISOString();
   const provenance = `Gmail: ${String(row.msg_subject)}`;
   const sourceRecordId = row.msg_source_id ? String(row.msg_source_id) : null;
 
   const tx = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO edges (
-        id, workspace_id, source_id, target_id, relationship_type, label, provenance,
-        evidence_text, source_record_id, fact_status, is_demo, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-    `).run(
-      edgeId,
-      workspaceId,
-      sourceNode.id,
-      targetNode.id,
-      relType,
-      relType.toLowerCase().replace(/_/g, ' '),
-      provenance,
-      String(row.evidence_quote),
-      sourceRecordId,
-      String(row.fact_status),
-      now,
-    );
+    if (!existingEdge) {
+      db.prepare(`
+        INSERT INTO edges (
+          id, workspace_id, source_id, target_id, relationship_type, label, provenance,
+          evidence_text, source_record_id, fact_status, is_demo, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(
+        edgeId,
+        workspaceId,
+        sourceNode.id,
+        targetNode.id,
+        relType,
+        relType.toLowerCase().replace(/_/g, ' '),
+        provenance,
+        String(row.evidence_quote),
+        sourceRecordId,
+        String(row.fact_status),
+        now,
+      );
+    }
 
     db.prepare(`
       UPDATE email_suggested_relationships

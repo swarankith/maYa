@@ -415,14 +415,14 @@ export async function runRippleImpactAnalysis(
           supportingEvidence: buildEvidenceLookup(nextChain, edgesById, sourcesById),
           factStatus: nextFactStatus,
         });
-      }
 
-      queue.push({
-        nodeId: depTask.id,
-        pathNames: nextPath,
-        chainEdgeIds: nextChain,
-        factStatus: nextFactStatus,
-      });
+        queue.push({
+          nodeId: depTask.id,
+          pathNames: nextPath,
+          chainEdgeIds: nextChain,
+          factStatus: nextFactStatus,
+        });
+      }
     }
   }
 
