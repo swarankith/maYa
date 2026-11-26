@@ -48,22 +48,24 @@ export function PermissionMarker({
   executionMode,
 }: {
   valid: boolean;
-  executionMode: 'SIMULATED_DEMO' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH';
+  executionMode: 'SIMULATED_DEMO' | 'SIMULATED_LOCAL' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH' | 'UNSUPPORTED';
 }) {
-  if (!valid) {
+  if (!valid || executionMode === 'UNSUPPORTED') {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-medium text-rose-400">
         <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
-        <span>Permission denied</span>
+        <span>{executionMode === 'UNSUPPORTED' ? 'Unsupported (Scope Missing)' : 'Permission denied'}</span>
       </span>
     );
   }
   const label =
     executionMode === 'SIMULATED_DEMO'
       ? 'Permitted (Simulated Demo)'
-      : executionMode === 'LOCAL_WORKSPACE'
-        ? 'Permitted (Local Workspace)'
-        : 'Permitted (Live OAuth)';
+      : executionMode === 'SIMULATED_LOCAL'
+        ? 'Permitted (Simulated Local)'
+        : executionMode === 'LOCAL_WORKSPACE'
+          ? 'Permitted (Local Workspace)'
+          : 'Permitted (Live OAuth)';
   return (
     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-teal-400">
       <ShieldCheck className="h-3.5 w-3.5 shrink-0" />

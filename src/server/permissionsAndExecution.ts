@@ -17,6 +17,28 @@ const ALLOWED_LOCAL_SCOPES = new Set([
   'gmail.compose',
 ]);
 
+const GMAIL_COMPOSE_SCOPE = 'https://www.googleapis.com/auth/gmail.compose';
+const CALENDAR_EVENTS_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+const TASKS_WRITE_SCOPE = 'https://www.googleapis.com/auth/tasks';
+
+function getGrantedGmailScopes(workspaceId: string): { connected: boolean; scopes: string[] } {
+  const row = db
+    .prepare('SELECT status, scopes_json FROM gmail_connections WHERE workspace_id = ?')
+    .get(workspaceId) as { status: string; scopes_json: string } | undefined;
+  if (!row || row.status !== 'CONNECTED') {
+    return { connected: false, scopes: [] };
+  }
+  try {
+    const parsed = JSON.parse(String(row.scopes_json ?? '[]'));
+    return {
+      connected: true,
+      scopes: Array.isArray(parsed) ? parsed.map((s) => String(s)) : [],
+    };
+  } catch {
+    return { connected: true, scopes: [] };
+  }
+}
+
 export function validatePermissionForScope(
   workspaceId: string,
   scope: string,
@@ -27,40 +49,67 @@ export function validatePermissionForScope(
 } {
   const isDemo = workspaceId === DEMO_WORKSPACE_ID;
   const integrations = getIntegrations(workspaceId);
-  const calConnected =
-    integrations.find((i) => i.serviceKey === 'google_calendar')?.status === 'CONNECTED';
-  const tasksConnected =
-    integrations.find((i) => i.serviceKey === 'google_tasks')?.status === 'CONNECTED';
-  const gmailConnected =
-    integrations.find((i) => i.serviceKey === 'gmail')?.status === 'CONNECTED';
+  const calConnector = integrations.find((i) => i.serviceKey === 'google_calendar');
+  const tasksConnector = integrations.find((i) => i.serviceKey === 'google_tasks');
+  const gmailConn = getGrantedGmailScopes(workspaceId);
+
+  const calHasWriteScope =
+    calConnector?.status === 'CONNECTED' &&
+    calConnector.grantedScopes.includes(CALENDAR_EVENTS_SCOPE);
+  const tasksHasWriteScope =
+    tasksConnector?.status === 'CONNECTED' &&
+    tasksConnector.grantedScopes.includes(TASKS_WRITE_SCOPE);
+  const gmailHasComposeScope =
+    gmailConn.connected && gmailConn.scopes.includes(GMAIL_COMPOSE_SCOPE);
 
   if (!ALLOWED_LOCAL_SCOPES.has(scope)) {
     return {
       valid: false,
-      executionMode: isDemo ? 'SIMULATED_DEMO' : 'LOCAL_WORKSPACE',
+      executionMode: 'UNSUPPORTED',
       reason: `Scope "${scope}" is outside the permitted action policy.`,
     };
   }
 
-  if (scope === 'calendar.events' && calConnected) {
+  if (scope === 'gmail.compose') {
+    if (isDemo) {
+      return {
+        valid: true,
+        executionMode: 'SIMULATED_DEMO',
+        reason:
+          'DEMO MODE: Gmail compose is not connected. Policy permits local simulated notification draft only (no email sent or drafted in Gmail).',
+      };
+    }
+    if (!gmailHasComposeScope) {
+      return {
+        valid: false,
+        executionMode: 'UNSUPPORTED',
+        reason: gmailConn.connected
+          ? 'Gmail compose is unavailable: connected account only granted read-only scope (gmail.readonly); gmail.compose scope is not granted.'
+          : 'Gmail compose is unavailable: required gmail.compose OAuth scope is not granted.',
+      };
+    }
     return {
-      valid: true,
-      executionMode: 'LIVE_OAUTH',
-      reason: 'Google Calendar OAuth scope granted; awaiting explicit user approval.',
+      valid: false,
+      executionMode: 'UNSUPPORTED',
+      reason:
+        'Gmail draft creation is currently unsupported: no real Gmail compose execution handler is enabled.',
     };
   }
-  if (scope === 'tasks.write' && tasksConnected) {
+
+  if (scope === 'calendar.events' && calHasWriteScope) {
     return {
       valid: true,
-      executionMode: 'LIVE_OAUTH',
-      reason: 'Google Tasks OAuth scope granted; awaiting explicit user approval.',
+      executionMode: 'LOCAL_WORKSPACE',
+      reason:
+        'Calendar scope granted, but external Calendar write handler is not yet enabled; updates local workspace only.',
     };
   }
-  if (scope === 'gmail.compose' && gmailConnected) {
+  if (scope === 'tasks.write' && tasksHasWriteScope) {
     return {
       valid: true,
-      executionMode: 'LIVE_OAUTH',
-      reason: 'Gmail OAuth scope granted; awaiting explicit user approval.',
+      executionMode: 'LOCAL_WORKSPACE',
+      reason:
+        'Tasks scope granted, but external Tasks write handler is not yet enabled; updates local workspace only.',
     };
   }
 
@@ -189,61 +238,76 @@ export function executeApprovedAction(
   if (approval.status !== 'PENDING') {
     throw new Error(`Approval "${approvalId}" has already been ${approval.status.toLowerCase()}.`);
   }
-  if (!approval.permissionValid) {
+  if (!approval.permissionValid || approval.executionMode === 'UNSUPPORTED') {
     throw new Error(`Permission check failed: ${approval.permissionReason}`);
+  }
+  if (approval.executionMode === 'LIVE_OAUTH') {
+    throw new Error(
+      `Live OAuth execution for "${approval.actionType}" is not enabled; external Google API writes are disabled.`,
+    );
   }
 
   const now = new Date().toISOString();
   const field = String(approval.proposedPayload.field ?? 'date');
   const afterValue = String(approval.proposedPayload.afterValue ?? '');
   const modeLabel =
-    approval.executionMode === 'SIMULATED_DEMO' ? 'Simulated' : 'Workspace Approved';
+    approval.executionMode === 'SIMULATED_DEMO' || approval.executionMode === 'SIMULATED_LOCAL'
+      ? 'Simulated'
+      : 'Workspace Approved';
 
-  const targetNode = getNodeById(workspaceId, approval.targetNodeId);
-  if (targetNode) {
-    if (approval.actionType === 'UPDATE_DEADLINE') {
-      updateNode(workspaceId, targetNode.id, {
-        date: afterValue,
-        subtitle: `${formatFriendlyDate(afterValue)} · Updated via Approved Plan`,
-        status: `Updated (${modeLabel})`,
-        provenance: `Approved Action (${approval.id})`,
-      });
-      if (targetNode.projectId) {
-        const proj = getNodeById(workspaceId, targetNode.projectId);
-        if (proj) {
-          updateNode(workspaceId, proj.id, {
-            date: afterValue.slice(0, 10),
-            status: `Aligned (${modeLabel})`,
-          });
+  if (approval.actionType === 'SEND_NOTIFICATION_DRAFT') {
+    if (approval.executionMode !== 'SIMULATED_DEMO' && approval.executionMode !== 'SIMULATED_LOCAL') {
+      throw new Error(
+        'Gmail draft creation is unsupported: no real Gmail compose execution handler is enabled.',
+      );
+    }
+  } else {
+    const targetNode = getNodeById(workspaceId, approval.targetNodeId);
+    if (targetNode) {
+      if (approval.actionType === 'UPDATE_DEADLINE') {
+        updateNode(workspaceId, targetNode.id, {
+          date: afterValue,
+          subtitle: `${formatFriendlyDate(afterValue)} · Updated via Approved Plan`,
+          status: `Updated (${modeLabel})`,
+          provenance: `Approved Action (${approval.id})`,
+        });
+        if (targetNode.projectId) {
+          const proj = getNodeById(workspaceId, targetNode.projectId);
+          if (proj) {
+            updateNode(workspaceId, proj.id, {
+              date: afterValue.slice(0, 10),
+              status: `Aligned (${modeLabel})`,
+            });
+          }
         }
+      } else if (
+        approval.actionType === 'UPDATE_TASK_DUE_DATE' ||
+        approval.actionType === 'RESCHEDULE_MEETING'
+      ) {
+        updateNode(workspaceId, targetNode.id, {
+          date: afterValue,
+          subtitle: `${formatFriendlyDate(afterValue)} · Rescheduled (${modeLabel})`,
+          status: `Rescheduled (${modeLabel})`,
+          provenance: `Approved Action (${approval.id})`,
+        });
+      } else if (approval.actionType === 'UPDATE_DOCUMENT_TEXT') {
+        updateNode(workspaceId, targetNode.id, {
+          date: afterValue,
+          subtitle: `Updated deadline reference: ${formatFriendlyDate(afterValue)}`,
+          status: `Revised (${modeLabel})`,
+          metadata: {
+            referencedDeadline: afterValue.slice(0, 10),
+            referencedDeadlineText: formatFriendlyDate(afterValue),
+          },
+          provenance: `Approved Action (${approval.id})`,
+        });
+      } else if (approval.actionType === 'REASSIGN_TASK') {
+        updateNode(workspaceId, targetNode.id, {
+          subtitle: `Assignee updated: ${afterValue} (${modeLabel})`,
+          status: `Reassigned (${modeLabel})`,
+          metadata: { coReviewers: afterValue },
+        });
       }
-    } else if (
-      approval.actionType === 'UPDATE_TASK_DUE_DATE' ||
-      approval.actionType === 'RESCHEDULE_MEETING'
-    ) {
-      updateNode(workspaceId, targetNode.id, {
-        date: afterValue,
-        subtitle: `${formatFriendlyDate(afterValue)} · Rescheduled (${modeLabel})`,
-        status: `Rescheduled (${modeLabel})`,
-        provenance: `Approved Action (${approval.id})`,
-      });
-    } else if (approval.actionType === 'UPDATE_DOCUMENT_TEXT') {
-      updateNode(workspaceId, targetNode.id, {
-        date: afterValue,
-        subtitle: `Updated deadline reference: ${formatFriendlyDate(afterValue)}`,
-        status: `Revised (${modeLabel})`,
-        metadata: {
-          referencedDeadline: afterValue.slice(0, 10),
-          referencedDeadlineText: formatFriendlyDate(afterValue),
-        },
-        provenance: `Approved Action (${approval.id})`,
-      });
-    } else if (approval.actionType === 'REASSIGN_TASK') {
-      updateNode(workspaceId, targetNode.id, {
-        subtitle: `Assignee updated: ${afterValue} (${modeLabel})`,
-        status: `Reassigned (${modeLabel})`,
-        metadata: { coReviewers: afterValue },
-      });
     }
   }
 
@@ -252,7 +316,10 @@ export function executeApprovedAction(
   ).run(
     'APPROVED',
     now,
-    decisionNote ?? 'Approved by user in Controlled Execution queue.',
+    decisionNote ??
+      (approval.actionType === 'SEND_NOTIFICATION_DRAFT'
+        ? 'Approved in simulation mode only; no email drafted or sent in Gmail.'
+        : 'Approved by user in Controlled Execution queue.'),
     approvalId,
     workspaceId,
   );
@@ -262,15 +329,20 @@ export function executeApprovedAction(
     .get(approvalId, workspaceId) as Record<string, unknown>;
   const updated = mapApprovalRow(updatedRow);
 
+  const auditSummary =
+    approval.actionType === 'SEND_NOTIFICATION_DRAFT'
+      ? `[${updated.executionMode}] Simulated notification draft only (no email sent or drafted in Gmail) for "${updated.targetLabel}".`
+      : `[${updated.executionMode}] Executed ${updated.actionType} on "${updated.targetLabel}": ${JSON.stringify(
+          updated.beforeState,
+        )} -> ${JSON.stringify(updated.afterState)}.`;
+
   recordAuditLog(workspaceId, {
     approvalId: updated.id,
     actionType: updated.actionType,
     targetLabel: updated.targetLabel,
     status: 'EXECUTED_SIMULATED',
     executionMode: updated.executionMode,
-    summary: `[${updated.executionMode}] Executed ${updated.actionType} on "${updated.targetLabel}": ${JSON.stringify(
-      updated.beforeState,
-    )} -> ${JSON.stringify(updated.afterState)}.`,
+    summary: auditSummary,
     details: {
       field,
       before: updated.beforeState,

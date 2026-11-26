@@ -4,11 +4,14 @@ import { db, initializeDatabase } from '../src/server/db.ts';
 import { registerUser, revokeSessionToken } from '../src/server/authService.ts';
 import { encryptSecret } from '../src/server/cryptoService.ts';
 import {
+  DEFAULT_GEMINI_MODEL,
   EMAIL_EXTRACTED_ITEM_TYPES,
   EMAIL_RELEVANCE_VALUES,
   extractAndStageEmailBatch,
   GeminiSchemaValidationError,
+  getConfiguredGeminiModel,
   isRetryableGeminiError,
+  normalizeIsoProposedDate,
   parseAndValidateBatchEmailExtraction,
   parseAndValidateEmailExtraction,
   parseRetryDelayMs,
@@ -1648,6 +1651,262 @@ async function main(): Promise<void> {
       });
       assert.equal(pass2.completedCount, 1, '503 email must recover cleanly on retry');
       console.log('PASS [19/19]: 503 UNAVAILABLE remains retryable separately from schema validation errors');
+    }
+
+    // 20. GEMINI_MODEL env configuration & default GA model fallback
+    {
+      const prevModel = process.env.GEMINI_MODEL;
+      try {
+        delete process.env.GEMINI_MODEL;
+        assert.equal(getConfiguredGeminiModel(), DEFAULT_GEMINI_MODEL);
+        assert.equal(DEFAULT_GEMINI_MODEL, 'gemini-3.5-flash-lite');
+
+        process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+        assert.equal(getConfiguredGeminiModel(), 'gemini-3.8-flash');
+
+        const seenModels: string[] = [];
+        const user = createTestUser('modelcfg');
+        insertTestMessage({
+          id: 'msg-model-cfg',
+          workspaceId: user.workspace.id,
+          gmailMessageId: 'g-model-cfg',
+          subject: 'Model Config Check',
+          receivedAt: '2026-11-25T10:00:00Z',
+        });
+
+        await extractAndStageEmailBatch(
+          user.workspace.id,
+          [
+            {
+              messageRowId: 'msg-model-cfg',
+              gmailMessageId: 'g-model-cfg',
+              sender: 'lead@example.com',
+              subject: 'Model Config Check',
+              receivedAt: '2026-11-25T10:00:00Z',
+              bodyText: 'Finish release checklist by 2026-12-03.',
+            },
+          ],
+          async ({ model, contents }) => {
+            seenModels.push(model);
+            return makeBatchResponse(extractBatchIdsFromPrompt(contents), 'ModelCfg');
+          },
+        );
+
+        await extractChangeFromText(
+          'Deadline update',
+          'Move deadline to 2026-11-26',
+          [],
+          {
+            geminiCaller: async ({ model }) => {
+              seenModels.push(model);
+              return JSON.stringify({
+                projectTitleMatch: 'Demo',
+                fieldChanged: 'deadline',
+                originalDateHint: '2026-11-27',
+                newDateIso: '2026-11-26',
+                summary: 'Moved deadline.',
+              });
+            },
+          },
+        );
+
+        const dummyAnalysis: Omit<ImpactAnalysisResult, 'aiNarrative' | 'aiStatus'> = {
+          id: 'imp-model-test',
+          workspaceId: user.workspace.id,
+          changeEvent: {
+            id: 'chg-1',
+            projectId: 'p-1',
+            projectTitle: 'Demo',
+            targetNodeId: 'd-1',
+            targetNodeTitle: 'Deadline',
+            fieldChanged: 'deadline',
+            originalValue: '2026-11-27',
+            newValue: '2026-11-26',
+            sourceRecordId: 'src-1',
+            sourceRecordTitle: 'Msg',
+            extractionMethod: 'GEMINI_NLU',
+            extractionConfidenceNote: 'test',
+            detectedAt: '2026-11-25T10:00:00Z',
+          },
+          directImpacts: [],
+          downstreamImpacts: [],
+          unaffectedItems: [],
+          explanationSummary: 'Test summary',
+          createdAt: '2026-11-25T10:00:00Z',
+        };
+
+        await generateExplainableNarrative(dummyAnalysis, {
+          geminiCaller: async ({ model }) => {
+            seenModels.push(model);
+            return 'Concise briefing.';
+          },
+        });
+
+        assert.deepEqual(seenModels, [
+          'gemini-3.8-flash',
+          'gemini-3.8-flash',
+          'gemini-3.8-flash',
+        ]);
+        console.log('PASS [20/24]: GEMINI_MODEL configuration and default GA fallback verified across all call sites');
+      } finally {
+        if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+        else process.env.GEMINI_MODEL = prevModel;
+      }
+    }
+
+    // 21. Safe enum normalization (case/whitespace/hyphen) without coercing unknown labels
+    {
+      const normalized = parseAndValidateEmailExtraction(
+        JSON.stringify({
+          summary: 'Plan shifted to Dec 2',
+          relevance: ' relevant ',
+          items: [
+            {
+              itemType: 'plan-change',
+              title: 'Move launch review',
+              proposedDate: '2026-12-02',
+              dateAmbiguous: false,
+              factStatus: 'confirmed',
+              evidenceQuote: 'Let us move launch review to Dec 2.',
+            },
+          ],
+          relationships: [
+            {
+              sourceTitle: 'Move launch review',
+              targetTitle: 'Launch Project',
+              relationshipType: 'belongs to',
+              rationale: 'Part of Launch Project',
+              evidenceQuote: 'Move launch review for Launch Project.',
+              factStatus: 'inferred',
+            },
+          ],
+        }),
+      );
+      assert.equal(normalized.relevance, 'RELEVANT');
+      assert.equal(normalized.items[0].itemType, 'PLAN_CHANGE');
+      assert.equal(normalized.items[0].factStatus, 'CONFIRMED');
+      assert.equal(normalized.relationships[0].relationshipType, 'BELONGS_TO');
+      assert.equal(normalized.relationships[0].factStatus, 'INFERRED');
+
+      const lowSignal = parseAndValidateEmailExtraction(
+        JSON.stringify({
+          summary: 'Weekly digest',
+          relevance: 'low-signal',
+          items: [],
+          relationships: [],
+        }),
+      );
+      assert.equal(lowSignal.relevance, 'LOW_SIGNAL');
+      console.log('PASS [21/24]: Safe enum normalization handles case/whitespace/hyphen variants');
+    }
+
+    // 22. ISO timestamps with optional seconds and timezone normalize cleanly
+    {
+      assert.equal(normalizeIsoProposedDate('2026-12-01T15:00:00Z'), '2026-12-01T15:00');
+      assert.equal(normalizeIsoProposedDate('2026-12-01T15:30:00+05:30'), '2026-12-01T10:00');
+      assert.equal(normalizeIsoProposedDate('2026-12-01 09:45:12'), '2026-12-01T09:45');
+
+      const parsed = parseAndValidateEmailExtraction(
+        JSON.stringify({
+          summary: 'Meeting scheduled',
+          relevance: 'RELEVANT',
+          items: [
+            {
+              itemType: 'MEETING',
+              title: 'Sync with Design',
+              proposedDate: '2026-12-01T15:00:00.000Z',
+              dateAmbiguous: false,
+              factStatus: 'CONFIRMED',
+              evidenceQuote: 'Meeting at 2026-12-01T15:00:00Z.',
+            },
+          ],
+          relationships: [],
+        }),
+      );
+      assert.equal(parsed.items[0].proposedDate, '2026-12-01T15:00');
+      console.log('PASS [22/24]: ISO timestamps with seconds and timezone offsets normalized cleanly');
+    }
+
+    // 23. Single-object response recovery preserves source email reference & zero fabricated dates
+    {
+      const user = createTestUser('singleobj');
+      const wsId = user.workspace.id;
+      insertTestMessage({
+        id: 'msg-single-obj',
+        workspaceId: wsId,
+        gmailMessageId: 'g-single-obj',
+        subject: 'Ambiguous Follow-up',
+        receivedAt: '2026-11-25T11:00:00Z',
+      });
+
+      const controller = new ExtractionQueueController({
+        concurrency: 1,
+        requestsPerMinute: 10,
+        batchSize: 1,
+        maxRetries: 2,
+        minSpacingMs: 0,
+      });
+
+      const res = await controller.processWorkspaceQueue(wsId, {
+        geminiCaller: async () =>
+          JSON.stringify({
+            summary: 'Ambiguous timing',
+            relevance: 'RELEVANT',
+            items: [
+              {
+                itemType: 'TASK',
+                title: 'Prepare Q4 notes',
+                proposedDate: null,
+                dateAmbiguous: true,
+                dateNote: 'Says "soon" with no calendar date.',
+                factStatus: 'CONFIRMED',
+                evidenceQuote: 'Please prepare Q4 notes soon.',
+              },
+            ],
+            relationships: [],
+          }),
+        awaitRetries: true,
+      });
+
+      assert.equal(res.completedCount, 1);
+      const staged = getExtractedItems(wsId);
+      assert.equal(staged.length, 1);
+      assert.equal(staged[0].messageRowId, 'msg-single-obj');
+      assert.equal(staged[0].gmailMessageId, 'g-single-obj');
+      assert.equal(staged[0].proposedDate, null, 'Ambiguous date must remain null, never fabricated');
+      assert.equal(staged[0].dateAmbiguous, true);
+      console.log('PASS [23/24]: Single-object recovery preserves source references and never fabricates dates');
+    }
+
+    // 24. Malformed non-ISO proposedDate is rejected cleanly without inventing a date
+    {
+      assert.throws(
+        () =>
+          parseAndValidateEmailExtraction(
+            JSON.stringify({
+              summary: 'Bad date format',
+              relevance: 'RELEVANT',
+              items: [
+                {
+                  itemType: 'DEADLINE',
+                  title: 'Submit report',
+                  proposedDate: 'next Friday',
+                  dateAmbiguous: false,
+                  factStatus: 'CONFIRMED',
+                  evidenceQuote: 'Submit report next Friday.',
+                },
+              ],
+              relationships: [],
+            }),
+          ),
+        (err: unknown) => {
+          assert.ok(err instanceof GeminiSchemaValidationError);
+          assert.ok(err.invalidField.endsWith('proposedDate'));
+          assert.equal(isRetryableGeminiError(err), false);
+          return true;
+        },
+      );
+      console.log('PASS [24/24]: Malformed non-ISO proposedDate rejected cleanly without fabricating dates');
     }
   } finally {
     for (const qKey of createdQuotaKeys) {

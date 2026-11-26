@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 const PLACEHOLDER_KEYS = new Set([
   '',
@@ -7,8 +7,19 @@ const PLACEHOLDER_KEYS = new Set([
   'REPLACE_ME',
 ]);
 
-function resolveEncryptionKey(): Buffer | null {
-  const raw = process.env.TOKEN_ENCRYPTION_KEY?.trim() ?? '';
+function decodeStrictBase64Key(raw: string): Buffer | null {
+  if (!/^[A-Za-z0-9+/]{42,44}={0,2}$/.test(raw) || raw.length % 4 !== 0) {
+    return null;
+  }
+  const decoded = Buffer.from(raw, 'base64');
+  if (decoded.length !== 32 || decoded.toString('base64') !== raw) {
+    return null;
+  }
+  return decoded;
+}
+
+export function resolveEncryptionKey(rawOverride?: string): Buffer | null {
+  const raw = (rawOverride ?? process.env.TOKEN_ENCRYPTION_KEY ?? '').trim();
   if (PLACEHOLDER_KEYS.has(raw)) {
     return null;
   }
@@ -17,20 +28,20 @@ function resolveEncryptionKey(): Buffer | null {
     return Buffer.from(raw, 'hex');
   }
 
-  try {
-    const b64 = Buffer.from(raw, 'base64');
-    if (b64.length === 32) {
-      return b64;
-    }
-  } catch {
-    // Fall through to SHA-256 key derivation
-  }
-
-  return createHash('sha256').update(raw, 'utf8').digest();
+  return decodeStrictBase64Key(raw);
 }
 
 export function isTokenEncryptionConfigured(): boolean {
   return resolveEncryptionKey() !== null;
+}
+
+export function assertProductionEncryptionKeyConfigured(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  if (!isTokenEncryptionConfigured()) {
+    throw new Error(
+      '[crypto] Fatal: TOKEN_ENCRYPTION_KEY must be configured in production as exactly 64 hex characters or a valid 32-byte base64 string.',
+    );
+  }
 }
 
 export function encryptSecret(plaintext: string): string {

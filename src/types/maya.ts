@@ -194,7 +194,7 @@ export interface ApprovalItem {
   afterState: Record<string, unknown>;
   rationale: string;
   status: 'PENDING' | 'APPROVED' | 'REJECTED';
-  executionMode: 'SIMULATED_DEMO' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH';
+  executionMode: 'SIMULATED_DEMO' | 'SIMULATED_LOCAL' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH' | 'UNSUPPORTED';
   decidedAt: string | null;
   decisionNote: string | null;
   createdAt: string;
@@ -207,7 +207,7 @@ export interface AuditLogEntry {
   actionType: string;
   targetLabel: string;
   status: 'EXECUTED_SIMULATED' | 'REJECTED' | 'DETECTED' | 'SIMULATED_PLAN' | 'SYSTEM';
-  executionMode: 'SIMULATED_DEMO' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH' | 'INTERNAL';
+  executionMode: 'SIMULATED_DEMO' | 'SIMULATED_LOCAL' | 'LOCAL_WORKSPACE' | 'LIVE_OAUTH' | 'UNSUPPORTED' | 'INTERNAL';
   summary: string;
   details: Record<string, unknown>;
   actor: string;

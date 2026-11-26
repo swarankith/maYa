@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -16,6 +16,9 @@ import {
   initializeDatabase,
   resetAndSeedDemoData,
 } from './src/server/db.ts';
+import { assertProductionEncryptionKeyConfigured } from './src/server/cryptoService.ts';
+import { AuthRateLimiter, getSafeClientIp } from './src/server/authRateLimiter.ts';
+import { getConfiguredGeminiModel } from './src/server/emailContextService.ts';
 import { extractChangeFromText } from './src/server/geminiService.ts';
 import {
   createEdge,
@@ -75,11 +78,81 @@ import type {
   WorkspaceInfo,
 } from './src/types/maya.ts';
 
+assertProductionEncryptionKeyConfigured();
 initializeDatabase();
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
+app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
+app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    res.status(400).json({ error: 'Invalid JSON request body.' });
+    return;
+  }
+  next(err);
+});
+
+const loginRateLimiter = new AuthRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  maxRequests: Number(process.env.AUTH_LOGIN_MAX_ATTEMPTS ?? 10) || 10,
+});
+const registerRateLimiter = new AuthRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  maxRequests: Number(process.env.AUTH_REGISTER_MAX_ATTEMPTS ?? 5) || 5,
+});
+
+app.use((req, res, next) => {
+  const isProdRuntime = process.env.NODE_ENV === 'production';
+  const csp = isProdRuntime
+    ? [
+        "default-src 'self'",
+        "script-src 'self' https://accounts.google.com/gsi/client",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' data: blob:",
+        "connect-src 'self' https://accounts.google.com",
+        "frame-src 'self' https://accounts.google.com",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join('; ')
+    : [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://accounts.google.com/gsi/client",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' data: blob:",
+        "connect-src 'self' ws: wss: https://accounts.google.com",
+        "frame-src 'self' https://accounts.google.com",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join('; ');
+
+  res.setHeader('Content-Security-Policy', csp);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  if (isSecureCookieRequest(req)) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+app.get('/healthz', (_req, res) => {
+  try {
+    const row = db.prepare('SELECT 1 AS ok').get() as { ok?: number } | undefined;
+    if (row?.ok === 1) {
+      res.status(200).json({ status: 'ok', database: 'ok' });
+      return;
+    }
+    res.status(503).json({ status: 'error', database: 'unavailable' });
+  } catch {
+    res.status(503).json({ status: 'error', database: 'unavailable' });
+  }
+});
 
 interface AuthenticatedRequest extends Request {
   auth?: {
@@ -89,17 +162,114 @@ interface AuthenticatedRequest extends Request {
   };
 }
 
+const SESSION_COOKIE_NAME = 'maya_session';
+const CSRF_COOKIE_NAME = 'maya_csrf';
+const SESSION_COOKIE_MAX_AGE_SEC = 7 * 24 * 60 * 60;
+
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.cookie;
+  if (!header) return {};
+  const result: Record<string, string> = {};
+  for (const part of header.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = decodeURIComponent(part.slice(0, eqIdx).trim());
+    const val = decodeURIComponent(part.slice(eqIdx + 1).trim());
+    if (key) result[key] = val;
+  }
+  return result;
+}
+
+function isSecureCookieRequest(req: Request): boolean {
+  if (process.env.NODE_ENV !== 'production') return false;
+  const xfProto = req.headers['x-forwarded-proto']?.toString().split(',')[0]?.trim().toLowerCase();
+  return Boolean(req.secure || xfProto === 'https');
+}
+
+function setAuthCookies(req: Request, res: Response, sessionToken: string, existingCsrf?: string): void {
+  const secure = isSecureCookieRequest(req);
+  const csrfToken = existingCsrf && existingCsrf.length >= 32 ? existingCsrf : randomBytes(24).toString('hex');
+  res.cookie(SESSION_COOKIE_NAME, sessionToken, {
+    httpOnly: true,
+    secure,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_COOKIE_MAX_AGE_SEC * 1000,
+  });
+  res.cookie(CSRF_COOKIE_NAME, csrfToken, {
+    httpOnly: false,
+    secure,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_COOKIE_MAX_AGE_SEC * 1000,
+  });
+}
+
+function clearAuthCookies(req: Request, res: Response): void {
+  const secure = isSecureCookieRequest(req);
+  res.clearCookie(SESSION_COOKIE_NAME, { httpOnly: true, secure, sameSite: 'lax', path: '/' });
+  res.clearCookie(CSRF_COOKIE_NAME, { httpOnly: false, secure, sameSite: 'lax', path: '/' });
+}
+
+function safeEqualStrings(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 function extractBearerToken(req: Request): string | undefined {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return undefined;
   return header.slice(7).trim() || undefined;
 }
 
+function extractSessionToken(req: Request): { token: string | undefined; viaCookie: boolean } {
+  const bearer = extractBearerToken(req);
+  if (bearer) {
+    return { token: bearer, viaCookie: false };
+  }
+  const cookies = parseCookies(req);
+  const cookieToken = cookies[SESSION_COOKIE_NAME]?.trim() || undefined;
+  return { token: cookieToken, viaCookie: Boolean(cookieToken) };
+}
+
+function validateCookieCsrf(req: Request): boolean {
+  const method = req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    return true;
+  }
+
+  const origin = req.headers.origin;
+  if (origin) {
+    const expectedOrigin = requestOriginHint(req);
+    try {
+      if (new URL(origin).origin !== new URL(expectedOrigin).origin) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  const cookies = parseCookies(req);
+  const cookieCsrf = cookies[CSRF_COOKIE_NAME] ?? '';
+  const headerCsrf = req.headers['x-csrf-token']?.toString() ?? '';
+  if (!cookieCsrf || !headerCsrf) {
+    return false;
+  }
+  return safeEqualStrings(cookieCsrf, headerCsrf);
+}
+
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const token = extractBearerToken(req);
+  const { token, viaCookie } = extractSessionToken(req);
   const verified = verifySessionToken(token);
   if (!verified || !token) {
     res.status(401).json({ error: 'Authentication required. Please sign in to access your workspace.' });
+    return;
+  }
+  if (viaCookie && !validateCookieCsrf(req)) {
+    res.status(403).json({ error: 'CSRF validation failed for cookie-authenticated request.' });
     return;
   }
   req.auth = {
@@ -206,6 +376,13 @@ function buildDashboardSummary(workspaceId: string): DashboardSummary {
 
 // --- Authentication Routes ---
 app.post('/api/auth/register', (req, res) => {
+  const clientIp = getSafeClientIp(req);
+  const limit = registerRateLimiter.consume(`register:${clientIp}`);
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    res.status(429).json({ error: 'Too many registration attempts. Please try again later.' });
+    return;
+  }
   try {
     const body = req.body as Record<string, unknown>;
     const session = registerUser({
@@ -213,6 +390,7 @@ app.post('/api/auth/register', (req, res) => {
       password: String(body.password ?? ''),
       displayName: typeof body.displayName === 'string' ? body.displayName : undefined,
     });
+    setAuthCookies(req, res, session.token);
     res.status(201).json(session);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'Registration failed' });
@@ -220,12 +398,20 @@ app.post('/api/auth/register', (req, res) => {
 });
 
 app.post('/api/auth/login', (req, res) => {
+  const clientIp = getSafeClientIp(req);
+  const limit = loginRateLimiter.consume(`login:${clientIp}`);
+  if (!limit.allowed) {
+    res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+    res.status(429).json({ error: 'Too many authentication attempts. Please try again later.' });
+    return;
+  }
   try {
     const body = req.body as Record<string, unknown>;
     const session = loginUser({
       email: String(body.email ?? ''),
       password: String(body.password ?? ''),
     });
+    setAuthCookies(req, res, session.token);
     res.json(session);
   } catch (err) {
     res.status(401).json({ error: err instanceof Error ? err.message : 'Login failed' });
@@ -233,12 +419,21 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
-  const token = extractBearerToken(req);
+  const { token, viaCookie } = extractSessionToken(req);
+  if (viaCookie && token && !validateCookieCsrf(req)) {
+    res.status(403).json({ error: 'CSRF validation failed for logout request.' });
+    return;
+  }
   revokeSessionToken(token);
+  clearAuthCookies(req, res);
   res.json({ ok: true });
 });
 
 app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
+  const cookies = parseCookies(req);
+  if (cookies[SESSION_COOKIE_NAME] || !extractBearerToken(req)) {
+    setAuthCookies(req, res, req.auth!.token, cookies[CSRF_COOKIE_NAME]);
+  }
   res.json({
     user: req.auth!.user,
     workspace: req.auth!.workspace,
@@ -506,7 +701,7 @@ function createWorkspaceRouter(
         sourceRecord,
         extractionMethod: extracted.usedGemini ? 'GEMINI_NLU' : 'DETERMINISTIC_PARSER',
         extractionNote: extracted.usedGemini
-          ? 'Extracted via Gemini API (gemini-4-hydrogen) JSON schema using strictly your workspace projects.'
+          ? `Extracted via Gemini API (${getConfiguredGeminiModel()}) JSON schema using strictly your workspace projects.`
           : extracted.aiError ?? 'Extracted via deterministic change parser.',
       });
 
@@ -754,7 +949,7 @@ demoRouter.post('/run', async (_req, res) => {
       sourceRecord: incomingEmail,
       extractionMethod: extracted.usedGemini ? 'GEMINI_NLU' : 'DETERMINISTIC_PARSER',
       extractionNote: extracted.usedGemini
-        ? 'Extracted structured deadline shift via Gemini API (gemini-4-hydrogen).'
+        ? `Extracted structured deadline shift via Gemini API (${getConfiguredGeminiModel()}).`
         : extracted.aiError ?? 'Extracted via deterministic change parser.',
     });
 

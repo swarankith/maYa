@@ -28,6 +28,9 @@ export function ApprovalsPage({
   const [error, setError] = useState<string | null>(null);
 
   const pendingItems = approvals.filter((a) => a.status === 'PENDING');
+  const pendingExecutableItems = pendingItems.filter(
+    (a) => a.permissionValid && a.executionMode !== 'UNSUPPORTED',
+  );
   const filtered = approvals.filter((a) => (filter === 'ALL' ? true : a.status === filter));
 
   const handleApprove = async (id: string) => {
@@ -82,7 +85,7 @@ export function ApprovalsPage({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {pendingItems.length > 0 && (
+          {pendingExecutableItems.length > 0 && (
             <button
               type="button"
               onClick={handleApproveAll}
@@ -91,7 +94,9 @@ export function ApprovalsPage({
             >
               <CheckCheck className="h-3.5 w-3.5" />
               <span>
-                {batchBusy ? 'Executing Approved...' : `Approve All Pending (${pendingItems.length})`}
+                {batchBusy
+                  ? 'Executing Approved...'
+                  : `Approve All Permitted (${pendingExecutableItems.length})`}
               </span>
             </button>
           )}
@@ -115,9 +120,10 @@ export function ApprovalsPage({
               : 'Execution Mode: Private Personal Workspace (External Google APIs Disconnected)'}
           </div>
           <p className="text-blue-200/80 leading-relaxed">
-            Approving actions updates your {mode === 'DEMO' ? 'isolated demo' : 'private personal'}{' '}
-            SQLite context graph and records an immutable entry in your Audit Trail. External
-            Gmail, Calendar, and Tasks APIs remain disconnected.
+            Approving permitted actions updates your{' '}
+            {mode === 'DEMO' ? 'isolated demo' : 'private personal'} SQLite context graph and
+            records an immutable entry in your Audit Trail. External Gmail compose, Calendar, and
+            Tasks write APIs are not enabled; unsupported actions remain blocked.
           </p>
         </div>
       </div>
@@ -199,10 +205,14 @@ export function ApprovalsPage({
                         }
                       >
                         {item.status === 'APPROVED'
-                          ? 'Executed'
+                          ? item.executionMode === 'SIMULATED_DEMO' || item.executionMode === 'SIMULATED_LOCAL'
+                            ? 'Approved (Simulated)'
+                            : 'Executed (Local Workspace)'
                           : item.status === 'REJECTED'
                             ? 'Rejected'
-                            : 'Awaiting Approval'}
+                            : item.executionMode === 'UNSUPPORTED' || !item.permissionValid
+                              ? 'Unsupported / Blocked'
+                              : 'Awaiting Approval'}
                       </span>
                     </div>
                     <h3 className="text-base font-medium text-slate-100">{item.targetLabel}</h3>
